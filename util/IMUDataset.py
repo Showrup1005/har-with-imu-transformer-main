@@ -45,9 +45,10 @@ class IMUDataset(Dataset):
         window_indices = list(range(start_index, (start_index + self.window_size)))
         imu = self.imu[window_indices, :]
         window_labels = self.labels[window_indices, :]
-        if len(np.unique(window_labels)) > 1:
-            logging.warning("Window includes more than one class present, introducing noise")
-        label = window_labels[0][0]
+        # if len(np.unique(window_labels)) > 1:
+        #     logging.warning("Window includes more than one class present, introducing noise")
+        # label = window_labels[0][0]
+        label = np.bincount(window_labels.flatten()).argmax()
         sample = {'imu': imu,
                   'label': label}
         return sample
