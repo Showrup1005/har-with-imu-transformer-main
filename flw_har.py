@@ -4,6 +4,17 @@ import numpy as np
 import json
 from torch.utils.data import DataLoader, Subset
 import warnings
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+import matplotlib.pyplot as plt
+import seaborn as sns
 warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
@@ -88,16 +99,54 @@ class IMUClient(fl.client.NumPyClient):
 # ====================== GLOBAL EVALUATION ======================
 def evaluate_global(model, test_loader):
     model.eval()
-    correct, total = 0, 0
+
+    all_preds = []
+    all_labels = []
+
     with torch.no_grad():
         for batch in test_loader:
             imu = batch["imu"].to(DEVICE).float()
-            label = batch["label"].to(DEVICE).long()
-            output = model({"imu": imu})
-            pred = output.argmax(dim=1)
-            correct += (pred == label).sum().item()
-            total += label.size(0)
-    return correct / total
+            labels = batch["label"].to(DEVICE).long()
+
+            outputs = model({"imu": imu})
+            preds = outputs.argmax(dim=1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    accuracy = accuracy_score(all_labels, all_preds)
+
+    precision = precision_score(
+        all_labels,
+        all_preds,
+        average="weighted",
+        zero_division=0
+    )
+
+    recall = recall_score(
+        all_labels,
+        all_preds,
+        average="weighted",
+        zero_division=0
+    )
+
+    f1 = f1_score(
+        all_labels,
+        all_preds,
+        average="weighted",
+        zero_division=0
+    )
+
+    cm = confusion_matrix(all_labels, all_preds)
+
+    report = classification_report(
+        all_labels,
+        all_preds,
+        digits=4,
+        zero_division=0
+    )
+
+    return accuracy, precision, recall, f1, cm, report
 
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
@@ -122,13 +171,54 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         state_dict = {k: torch.tensor(v) for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)}
         self.global_model.load_state_dict(state_dict, strict=True)
 
-        acc = evaluate_global(self.global_model, self.test_loader)
-        print(f"Global Accuracy: **{acc:.4f}**")
+        accuracy, precision, recall, f1, cm, report = evaluate_global(
+        self.global_model,
+        self.test_loader
+        )
 
-        if acc > self.best_acc:
-            self.best_acc = acc
-            torch.save(self.global_model.state_dict(), f"best_global_model_r{server_round}.pth")
-            print(f"Best model saved!")
+        print("\n==============================")
+        print(f"Round {server_round}")
+        print("==============================")
+
+        print(f"Accuracy : {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall   : {recall:.4f}")
+        print(f"F1 Score : {f1:.4f}")
+
+        print("\nClassification Report")
+        print(report)
+
+        print("Confusion Matrix")
+        print(cm)
+
+        if accuracy > self.best_acc:
+            self.best_acc = accuracy
+
+            torch.save(
+                self.global_model.state_dict(),
+                f"best_global_model_r{server_round}.pth"
+            )
+
+            print("Best model saved!")
+
+            plt.figure(figsize=(8,6))
+
+            sns.heatmap(
+                cm,
+                annot=True,
+                fmt="d",
+                cmap="Blues"
+            )
+
+            plt.xlabel("Predicted")
+            plt.ylabel("True")
+            plt.title(f"Confusion Matrix Round {server_round}")
+
+            plt.savefig("best_confusion_matrix.png")
+            plt.close()
+
+            with open("classification_report.txt", "w") as f:
+                f.write(report)
         return aggregated
 
 # ====================== MAIN ======================
