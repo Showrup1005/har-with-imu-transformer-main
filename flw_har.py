@@ -12,7 +12,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score
 )
-
+import time
 import matplotlib.pyplot as plt
 import seaborn as sns
 warnings.filterwarnings("ignore")
@@ -149,57 +149,111 @@ def evaluate_global(model, test_loader):
     return accuracy, precision, recall, f1, cm, report
 
 # ====================== STRATEGY ======================
+
+def get_model_size_bytes(model):
+    """Returns model size in bytes."""
+    return sum(
+        p.numel() * p.element_size()
+        for p in model.parameters()
+    )
+
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, **kwargs):
         super().__init__(**kwargs)
+
         self.test_loader = test_loader
+
         self.best_acc = 0.0
+
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
 
-    def aggregate_fit(self, server_round, results, failures):
-        print(f"\n📊 Round {server_round} | {len(results)} successful clients, {len(failures)} failures")
+        # Communication statistics
+        self.round_start_time = 0
+        self.total_comm_time = 0
 
+        self.model_size = get_model_size_bytes(self.global_model)
+
+        self.total_upload = 0
+        self.total_download = 0
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        self.round_start_time = time.perf_counter()
+
+        return super().configure_fit(
+            server_round,
+            parameters,
+            client_manager,
+        )
+
+    def aggregate_fit(self, server_round, results, failures):
         aggregated = super().aggregate_fit(server_round, results, failures)
+
         if aggregated is None:
-            print("Aggregation failed")
             return aggregated
 
         parameters, _ = aggregated
+
         params_ndarrays = parameters_to_ndarrays(parameters)
 
-        # Load global model
-        state_dict = {k: torch.tensor(v) for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)}
-        self.global_model.load_state_dict(state_dict, strict=True)
+        state_dict = {
+            k: torch.tensor(v)
+            for k, v in zip(
+                self.global_model.state_dict().keys(),
+                params_ndarrays,
+            )
+        }
 
-        accuracy, precision, recall, f1, cm, report = evaluate_global(
-        self.global_model,
-        self.test_loader
-        )
+        self.global_model.load_state_dict(state_dict)
 
-        print("\n==============================")
-        print(f"Round {server_round}")
-        print("==============================")
+        # -------------------------------
+        # Communication statistics
+        # -------------------------------
 
-        print(f"Accuracy : {accuracy:.4f}")
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall   : {recall:.4f}")
-        print(f"F1 Score : {f1:.4f}")
+        round_time = time.perf_counter() - self.round_start_time
 
-        print("\nClassification Report")
-        print(report)
+        self.total_comm_time += round_time
 
-        print("Confusion Matrix")
-        print(cm)
+        upload = self.model_size * NUM_CLIENTS
+        download = self.model_size * NUM_CLIENTS
 
-        if accuracy > self.best_acc:
-            self.best_acc = accuracy
+        self.total_upload += upload
+        self.total_download += download
 
-            torch.save(
-                self.global_model.state_dict(),
-                f"best_global_model_r{server_round}.pth"
+        total_comm = self.total_upload + self.total_download
+
+        print(f"\nRound {server_round}")
+
+        print(f"Communication Time : {round_time:.3f} sec")
+
+        print(f"Upload            : {upload/1024/1024:.2f} MB")
+
+        print(f"Download          : {download/1024/1024:.2f} MB")
+
+        print(f"Total Comm.       : {total_comm/1024/1024:.2f} MB")
+
+        # -----------------------------------
+        # Only evaluate after FINAL round
+        # -----------------------------------
+
+        if server_round == NUM_ROUNDS:
+
+            accuracy, precision, recall, f1, cm, report = evaluate_global(
+                self.global_model,
+                self.test_loader,
             )
 
-            print("Best model saved!")
+            print("\n========== FINAL RESULTS ==========")
+
+            print(f"Accuracy : {accuracy:.4f}")
+            print(f"Precision: {precision:.4f}")
+            print(f"Recall   : {recall:.4f}")
+            print(f"F1 Score : {f1:.4f}")
+
+            print("\nClassification Report")
+            print(report)
+
+            print("\nConfusion Matrix")
+            print(cm)
 
             plt.figure(figsize=(8,6))
 
@@ -212,13 +266,32 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
             plt.xlabel("Predicted")
             plt.ylabel("True")
-            plt.title(f"Confusion Matrix Round {server_round}")
+            plt.title("Final Confusion Matrix")
 
-            plt.savefig("best_confusion_matrix.png")
+            plt.savefig("final_confusion_matrix.png")
+
             plt.close()
 
-            with open("classification_report.txt", "w") as f:
+            with open("classification_report.txt","w") as f:
                 f.write(report)
+
+            torch.save(
+                self.global_model.state_dict(),
+                "final_global_model.pth"
+            )
+
+            print("\n=========== Communication Summary ===========")
+
+            print(f"Model Size          : {self.model_size/1024/1024:.2f} MB")
+
+            print(f"Total Upload        : {self.total_upload/1024/1024:.2f} MB")
+
+            print(f"Total Download      : {self.total_download/1024/1024:.2f} MB")
+
+            print(f"Communication Total : {(self.total_upload+self.total_download)/1024/1024:.2f} MB")
+
+            print(f"Communication Time  : {self.total_comm_time:.3f} sec")
+
         return aggregated
 
 # ====================== MAIN ======================
