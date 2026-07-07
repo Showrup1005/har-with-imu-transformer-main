@@ -37,12 +37,15 @@ print(f"Using device: {DEVICE}")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
-    train_dataset = IMUDataset(train_csv, config["window_size"],
-                               config["input_dim"], config["window_shift"])
-    test_dataset = IMUDataset(test_csv, config["window_size"],
-                              config["input_dim"], config["window_shift"])
-    print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
-    return train_dataset, test_dataset
+    train_dataset = None  
+    test_dataset = IMUDataset(
+        test_csv, 
+        config["window_size"], 
+        config["input_dim"], 
+        config["window_shift"]
+    )
+    print(f"Test samples: {len(test_dataset)}")
+    return train_dataset, test_dataset  
 
 # def split_train_data(train_dataset, num_clients=NUM_CLIENTS):
 #     n = len(train_dataset)
@@ -57,64 +60,49 @@ def load_data(train_csv: str, test_csv: str):
 #         client_datasets.append(subset)
 #     return client_datasets
 
-def split_train_data(train_dataset,
-                     train_csv,
-                     num_clients=NUM_CLIENTS,
-                     save_file="subject_split.json"):
+def split_train_data(train_dataset, train_csv, num_clients=NUM_CLIENTS, 
+                     save_file="subject_split.json", seed=42):
 
     df = pd.read_csv(train_csv)
-
     subjects = sorted(df["subject"].unique())
 
     print(f"Total Subjects: {len(subjects)}")
 
-    # ----------------------------
-    # Load existing split
-    # ----------------------------
     if os.path.exists(save_file):
-
-        print("Loading existing subject split...")
-
+        print(f"Loading existing subject split from {save_file}")
         with open(save_file, "r") as f:
             client_subjects = json.load(f)
-
-    # ----------------------------
-    # Create split once
-    # ----------------------------
     else:
-
-        np.random.seed(42)
-
+        print(f"Creating new subject split and saving to {save_file}")
+        np.random.seed(seed)          # Fixed seed = reproducible
         np.random.shuffle(subjects)
-
+        
         groups = np.array_split(subjects, num_clients)
-
+        
         client_subjects = {
-            str(i): list(map(int, groups[i]))
+            str(i): [int(s) for s in groups[i]]
             for i in range(num_clients)
         }
-
+        
         with open(save_file, "w") as f:
             json.dump(client_subjects, f, indent=4)
 
-        print("Subject split saved.")
-
+    # Create client datasets (using the fixed version I gave earlier)
     client_datasets = []
-
     for cid in range(num_clients):
-
         group = client_subjects[str(cid)]
-
-        indices = df[df["subject"].isin(group)].index.tolist()
-
-        subset = Subset(train_dataset, indices)
-
-        client_datasets.append(subset)
-
-        print("\n--------------------------------")
-        print(f"Client {cid}")
-        print(f"Subjects : {group}")
-        print(f"Samples  : {len(indices)}")
+        
+        client_ds = IMUDataset(
+            train_csv,
+            config["window_size"],
+            config["input_dim"],
+            config["window_shift"],
+            subject_ids=group
+        )
+        
+        client_datasets.append(client_ds)
+        
+        print(f"Client {cid} → {len(group)} subjects | {len(client_ds)} windows")
 
     return client_datasets
 
