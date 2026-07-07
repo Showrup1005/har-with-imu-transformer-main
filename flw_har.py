@@ -31,13 +31,12 @@ with open('config.json', 'r') as f:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLIENTS = 3
 NUM_ROUNDS = 5
-LOCAL_EPOCHS = 1
+LOCAL_EPOCHS = 3
 
 print(f"Using device: {DEVICE}")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
-    train_dataset = None  
     test_dataset = IMUDataset(
         test_csv, 
         config["window_size"], 
@@ -45,7 +44,7 @@ def load_data(train_csv: str, test_csv: str):
         config["window_shift"]
     )
     print(f"Test samples: {len(test_dataset)}")
-    return train_dataset, test_dataset  
+    return None, test_dataset   # First return value is no longer needed 
 
 # def split_train_data(train_dataset, num_clients=NUM_CLIENTS):
 #     n = len(train_dataset)
@@ -60,12 +59,11 @@ def load_data(train_csv: str, test_csv: str):
 #         client_datasets.append(subset)
 #     return client_datasets
 
-def split_train_data(train_dataset, train_csv, num_clients=NUM_CLIENTS, 
+def split_train_data(train_csv, num_clients=NUM_CLIENTS, 
                      save_file="subject_split.json", seed=42):
-
+    
     df = pd.read_csv(train_csv)
     subjects = sorted(df["subject"].unique())
-
     print(f"Total Subjects: {len(subjects)}")
 
     if os.path.exists(save_file):
@@ -73,25 +71,18 @@ def split_train_data(train_dataset, train_csv, num_clients=NUM_CLIENTS,
         with open(save_file, "r") as f:
             client_subjects = json.load(f)
     else:
-        print(f"Creating new subject split and saving to {save_file}")
-        np.random.seed(seed)          # Fixed seed = reproducible
+        print(f"Creating new subject split...")
+        np.random.seed(seed)
         np.random.shuffle(subjects)
-        
         groups = np.array_split(subjects, num_clients)
-        
-        client_subjects = {
-            str(i): [int(s) for s in groups[i]]
-            for i in range(num_clients)
-        }
+        client_subjects = {str(i): [int(s) for s in groups[i]] for i in range(num_clients)}
         
         with open(save_file, "w") as f:
             json.dump(client_subjects, f, indent=4)
 
-    # Create client datasets (using the fixed version I gave earlier)
     client_datasets = []
     for cid in range(num_clients):
         group = client_subjects[str(cid)]
-        
         client_ds = IMUDataset(
             train_csv,
             config["window_size"],
@@ -99,9 +90,7 @@ def split_train_data(train_dataset, train_csv, num_clients=NUM_CLIENTS,
             config["window_shift"],
             subject_ids=group
         )
-        
         client_datasets.append(client_ds)
-        
         print(f"Client {cid} → {len(group)} subjects | {len(client_ds)} windows")
 
     return client_datasets
@@ -349,17 +338,15 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
-    train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(
-        train_dataset,
-        train_csv,
-        NUM_CLIENTS
-    )   
+    _, test_dataset = load_data(train_csv, test_csv)   # ignore train_dataset
+    
+    client_datasets = split_train_data(train_csv, NUM_CLIENTS)  # No need to pass train_dataset
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    def client_fn(cid: str):
-        return IMUClient(client_datasets[int(cid)]).to_client()
+    def client_fn(context: fl.common.Context) -> fl.client.Client:
+        cid = int(context.node_id) if hasattr(context, 'node_id') else int(context)
+        return IMUClient(client_datasets[cid]).to_client()
 
     strategy = SaveModelStrategy(
         test_loader=test_loader,
