@@ -4,6 +4,7 @@ import numpy as np
 import json
 from torch.utils.data import DataLoader, Subset
 import warnings
+import os
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -19,6 +20,7 @@ warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
+from torch.utils.data import Subset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 # ====================== CONFIG ======================
@@ -41,17 +43,78 @@ def load_data(train_csv: str, test_csv: str):
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
 
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS):
-    n = len(train_dataset)
-    indices = np.arange(n)
-    np.random.shuffle(indices)
+# def split_train_data(train_dataset, num_clients=NUM_CLIENTS):
+#     n = len(train_dataset)
+#     indices = np.arange(n)
+#     np.random.shuffle(indices)
+#     client_datasets = []
+#     size = n // num_clients
+#     for i in range(num_clients):
+#         start = i * size
+#         end = start + size if i < num_clients - 1 else n
+#         subset = Subset(train_dataset, indices[start:end])
+#         client_datasets.append(subset)
+#     return client_datasets
+
+def split_train_data(train_dataset,
+                     train_csv,
+                     num_clients=NUM_CLIENTS,
+                     save_file="subject_split.json"):
+
+    df = pd.read_csv(train_csv)
+
+    subjects = sorted(df["subject"].unique())
+
+    print(f"Total Subjects: {len(subjects)}")
+
+    # ----------------------------
+    # Load existing split
+    # ----------------------------
+    if os.path.exists(save_file):
+
+        print("Loading existing subject split...")
+
+        with open(save_file, "r") as f:
+            client_subjects = json.load(f)
+
+    # ----------------------------
+    # Create split once
+    # ----------------------------
+    else:
+
+        np.random.seed(42)
+
+        np.random.shuffle(subjects)
+
+        groups = np.array_split(subjects, num_clients)
+
+        client_subjects = {
+            str(i): list(map(int, groups[i]))
+            for i in range(num_clients)
+        }
+
+        with open(save_file, "w") as f:
+            json.dump(client_subjects, f, indent=4)
+
+        print("Subject split saved.")
+
     client_datasets = []
-    size = n // num_clients
-    for i in range(num_clients):
-        start = i * size
-        end = start + size if i < num_clients - 1 else n
-        subset = Subset(train_dataset, indices[start:end])
+
+    for cid in range(num_clients):
+
+        group = client_subjects[str(cid)]
+
+        indices = df[df["subject"].isin(group)].index.tolist()
+
+        subset = Subset(train_dataset, indices)
+
         client_datasets.append(subset)
+
+        print("\n--------------------------------")
+        print(f"Client {cid}")
+        print(f"Subjects : {group}")
+        print(f"Samples  : {len(indices)}")
+
     return client_datasets
 
 # ====================== CLIENT ======================
@@ -231,20 +294,21 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         print(f"Total Comm.       : {total_comm/1024/1024:.2f} MB")
 
-        # -----------------------------------
-        # Only evaluate after FINAL round
-        # -----------------------------------
+        accuracy, precision, recall, f1, cm, report = evaluate_global(
+                    self.global_model,
+                    self.test_loader,
+                )
+    
+        print("\n==============================")
+        print(f"Round {server_round}")
+        print("==============================")
+
+        print(f"Global Accuracy : {accuracy:.4f}")
 
         if server_round == NUM_ROUNDS:
 
-            accuracy, precision, recall, f1, cm, report = evaluate_global(
-                self.global_model,
-                self.test_loader,
-            )
-
             print("\n========== FINAL RESULTS ==========")
 
-            print(f"Accuracy : {accuracy:.4f}")
             print(f"Precision: {precision:.4f}")
             print(f"Recall   : {recall:.4f}")
             print(f"F1 Score : {f1:.4f}")
@@ -297,7 +361,11 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(train_dataset)
+    client_datasets = split_train_data(
+        train_dataset,
+        train_csv,
+        NUM_CLIENTS
+    )   
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
@@ -321,7 +389,6 @@ def main(train_csv: str, test_csv: str):
         client_resources={"num_cpus": 1, "num_gpus": 0.1 if torch.cuda.is_available() else 0},
     )
 
-    print(f"\nFinished! Best Accuracy: {strategy.best_acc:.4f}")
 
 if __name__ == "__main__":
     main("train.csv", "test.csv")
