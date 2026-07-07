@@ -5,6 +5,7 @@ import json
 from torch.utils.data import DataLoader, Subset
 import warnings
 import os
+import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
