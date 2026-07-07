@@ -178,6 +178,12 @@ def main(train_csv: str, test_csv: str):
             cid = int(context.node_id)
         else:
             cid = int(context)
+        
+        # Critical safety fix
+        if cid >= len(client_datasets):
+            cid = cid % len(client_datasets)
+        
+        print(f"Client {cid} requested")  # for debugging
         return IMUClient(client_datasets[cid]).to_client()
 
     strategy = SaveModelStrategy(test_loader=test_loader)
