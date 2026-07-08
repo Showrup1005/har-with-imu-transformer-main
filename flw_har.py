@@ -30,7 +30,7 @@ NUM_CLIENTS = 3
 NUM_ROUNDS = 5
 LOCAL_EPOCHS = 1
 
-print(f"Using device: {DEVICE} | FedProx mu={MU}")
+print(f"Using device: {DEVICE}")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -54,14 +54,16 @@ def split_train_data(train_dataset, num_clients=NUM_CLIENTS):
         client_datasets.append(subset)
     return client_datasets
 
-# ====================== CLIENT with FedProx ======================
+# ====================== CLIENT ======================
 class IMUClient(fl.client.NumPyClient):
     def __init__(self, train_subset):
         self.model = IMUTransformerEncoder(config).to(DEVICE)
-        self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"]*0.5, weight_decay=config.get("weight_decay", 1e-4))
+        self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"],
+                                       shuffle=True, num_workers=0)
+        self.optimizer = torch.optim.Adam(self.model.parameters(),
+                                          lr=config["lr"],
+                                          weight_decay=config.get("weight_decay", 1e-4))
         self.criterion = torch.nn.NLLLoss()
-        self.global_params = None  # Will store global model for proximal term
 
     def get_parameters(self, config=None):
         """Return parameters as list of numpy arrays"""
@@ -76,28 +78,18 @@ class IMUClient(fl.client.NumPyClient):
 
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params_ndarrays)}
         self.model.load_state_dict(state_dict, strict=True)
-        self.global_params = [p.clone() for p in self.model.parameters()]  # Save for proximal
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         self.model.train()
         total_loss = 0.0
-
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
-
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
                 loss = self.criterion(output, label)
-
-                # === FedProx Proximal Term ===
-                proximal_term = 0.0
-                for p, g_p in zip(self.model.parameters(), self.global_params):
-                    proximal_term += (MU / 2) * torch.norm(p - g_p) ** 2
-                loss += proximal_term
-
                 loss.backward()
                 self.optimizer.step()
                 total_loss += loss.item()
@@ -154,7 +146,7 @@ def evaluate_global(model, test_loader):
         zero_division=0
     )
 
-    return accuracy, precision, recall, f1
+    return accuracy, precision, recall, f1, cm, report
 
 # ====================== STRATEGY ======================
 
@@ -213,9 +205,35 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         self.global_model.load_state_dict(state_dict)
 
-        # Global Evaluation
-        accuracy, precision, recall, f1, cm, report = evaluate_global(self.global_model, self.test_loader)
-        print(f"\nRound {server_round} - Global Accuracy: {accuracy:.4f}")
+        # -------------------------------
+        # Communication statistics
+        # -------------------------------
+
+        round_time = time.perf_counter() - self.round_start_time
+
+        self.total_comm_time += round_time
+
+        upload = self.model_size * NUM_CLIENTS
+        download = self.model_size * NUM_CLIENTS
+
+        self.total_upload += upload
+        self.total_download += download
+
+        total_comm = self.total_upload + self.total_download
+
+        print(f"\nRound {server_round}")
+
+        print(f"Communication Time : {round_time:.3f} sec")
+
+        print(f"Upload            : {upload/1024/1024:.2f} MB")
+
+        print(f"Download          : {download/1024/1024:.2f} MB")
+
+        print(f"Total Comm.       : {total_comm/1024/1024:.2f} MB")
+
+        # -----------------------------------
+        # Only evaluate after FINAL round
+        # -----------------------------------
 
         if server_round == NUM_ROUNDS:
 
@@ -283,18 +301,8 @@ def main(train_csv: str, test_csv: str):
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        else:
-            cid = int(context)
-        
-        # Critical safety fix
-        if cid >= len(client_datasets):
-            cid = cid % len(client_datasets)
-        
-        print(f"Client {cid} requested")  # for debugging
-        return IMUClient(client_datasets[cid]).to_client()
+    def client_fn(cid: str):
+        return IMUClient(client_datasets[int(cid)]).to_client()
 
     strategy = SaveModelStrategy(
         test_loader=test_loader,
@@ -303,14 +311,14 @@ def main(train_csv: str, test_csv: str):
         min_available_clients=NUM_CLIENTS,
     )
 
-    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds | LOCAL_EPOCHS={LOCAL_EPOCHS}\n")
+    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
+        client_resources={"num_cpus": 1, "num_gpus": 0.1 if torch.cuda.is_available() else 0},
     )
 
     print(f"\nFinished! Best Accuracy: {strategy.best_acc:.4f}")
