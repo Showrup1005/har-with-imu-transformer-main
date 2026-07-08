@@ -1,6 +1,5 @@
 import flwr as fl
 import torch
-import torch.nn.functional as F
 import numpy as np
 import warnings
 import os
@@ -92,6 +91,8 @@ class IMUClient(fl.client.NumPyClient):
                 output = self.model({"imu": imu})
 
                 ce_loss = self.criterion(output, labels)
+
+                # Simple prototype loss
                 proto_loss = 0.0
                 for i in range(len(labels)):
                     proto_loss += torch.norm(features[i] - features[labels[i]], p=2)**2
@@ -107,7 +108,7 @@ class IMUClient(fl.client.NumPyClient):
 
         return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
 
-# ====================== STRATEGY with Evaluation ======================
+# ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, **kwargs):
         super().__init__(**kwargs)
