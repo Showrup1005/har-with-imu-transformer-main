@@ -52,6 +52,23 @@ class IMUTransformerEncoder(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+                
+        def get_features(self, data):
+            """Extract features before classification head"""
+            src = data.get('imu')
+            src = self.input_proj(src.transpose(1, 2)).permute(2, 0, 1)
+
+            cls_token = self.cls_token.unsqueeze(1).repeat(1, src.shape[1], 1)
+            src = torch.cat([cls_token, src])
+
+            if self.encode_position:
+                src += self.position_embed
+
+            # Get transformer output (features)
+            transformer_output = self.transformer_encoder(src)
+            features = transformer_output[0]  # CLS token features
+
+            return features
 
     def forward(self, data):
         src = data.get('imu')  # Shape N x S x C with S = sequence length, N = batch size, C = channels
