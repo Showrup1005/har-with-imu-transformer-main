@@ -175,6 +175,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         self.total_upload = 0
         self.total_download = 0
+    
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        # Disable Flower client evaluation completely
+        return []
 
     def configure_fit(self, server_round, parameters, client_manager):
         self.round_start_time = time.perf_counter()
