@@ -305,11 +305,13 @@ def main(train_csv: str, test_csv: str):
         return IMUClient(client_datasets[int(cid)]).to_client()
 
     strategy = SaveModelStrategy(
-        test_loader=test_loader,
-        fraction_fit=1.0,
-        min_fit_clients=NUM_CLIENTS,
-        min_available_clients=NUM_CLIENTS,
-    )
+    test_loader=test_loader,
+    fraction_fit=1.0,
+    fraction_evaluate=0.0,
+    min_fit_clients=NUM_CLIENTS,
+    min_available_clients=NUM_CLIENTS,
+    min_evaluate_clients=0,
+)
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
