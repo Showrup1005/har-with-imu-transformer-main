@@ -23,8 +23,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLIENTS = 5
 NUM_ROUNDS = 30
 LOCAL_EPOCHS = 3
-MU = 0.01                    # FedProx strength
-PROTO_WEIGHT = 0.1           # Weight for prototype loss
+MU = 0.01
+PROTO_WEIGHT = 0.1
 
 print(f"Using device: {DEVICE} | FedProx mu={MU} | Proto weight={PROTO_WEIGHT}")
 
@@ -88,17 +88,13 @@ class IMUClient(fl.client.NumPyClient):
                 imu = batch["imu"].to(DEVICE).float()
                 labels = batch["label"].to(DEVICE).long()
 
-                # Forward
                 features = self.model.get_features({"imu": imu})
                 output = self.model({"imu": imu})
 
-                # Standard loss
                 ce_loss = self.criterion(output, labels)
-
-                # Prototype regularization loss
                 proto_loss = 0.0
                 for i in range(len(labels)):
-                    proto_loss += torch.norm(features[i] - features[labels[i]], p=2)**2   # Simple version
+                    proto_loss += torch.norm(features[i] - features[labels[i]], p=2)**2
                 proto_loss = proto_loss / len(labels)
 
                 loss = ce_loss + PROTO_WEIGHT * proto_loss
@@ -111,6 +107,45 @@ class IMUClient(fl.client.NumPyClient):
 
         return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
 
+# ====================== STRATEGY with Evaluation ======================
+class SaveModelStrategy(fl.server.strategy.FedAvg):
+    def __init__(self, test_loader, **kwargs):
+        super().__init__(**kwargs)
+        self.test_loader = test_loader
+        self.global_model = IMUTransformerEncoder(config).to(DEVICE)
+
+    def aggregate_fit(self, server_round, results, failures):
+        aggregated = super().aggregate_fit(server_round, results, failures)
+        if aggregated is None:
+            return aggregated
+
+        parameters, _ = aggregated
+        params_ndarrays = parameters_to_ndarrays(parameters)
+        state_dict = {k: torch.tensor(v) for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)}
+        self.global_model.load_state_dict(state_dict)
+
+        # Global Evaluation
+        accuracy = self.evaluate_global()
+        print(f"\nRound {server_round} - Global Accuracy: {accuracy:.4f}")
+
+        if server_round == NUM_ROUNDS:
+            print(f"Final Accuracy: {accuracy:.4f}")
+            torch.save(self.global_model.state_dict(), "final_global_model.pth")
+
+        return aggregated
+
+    def evaluate_global(self):
+        self.global_model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for batch in self.test_loader:
+                imu = batch["imu"].to(DEVICE).float()
+                labels = batch["label"].to(DEVICE).long()
+                output = self.global_model({"imu": imu})
+                preds = output.argmax(dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        return accuracy_score(all_labels, all_preds)
 
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
@@ -128,11 +163,7 @@ def main(train_csv: str, test_csv: str):
             cid = cid % len(client_datasets)
         return IMUClient(client_datasets[cid], cid).to_client()
 
-    strategy = fl.server.strategy.FedAvg(
-        fraction_fit=1.0,
-        min_fit_clients=NUM_CLIENTS,
-        min_available_clients=NUM_CLIENTS,
-    )
+    strategy = SaveModelStrategy(test_loader=test_loader)
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
