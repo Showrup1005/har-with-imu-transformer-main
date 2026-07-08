@@ -22,35 +22,28 @@ with open('config.json', 'r') as f:
     config = json.load(f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_CLIENTS = 3
-NUM_ROUNDS = 20
-LOCAL_EPOCHS = 5
+NUM_CLIENTS = 5          
+NUM_ROUNDS = 30
+LOCAL_EPOCHS = 3
+MU = 0.01                
 
-print(f"Using device: {DEVICE}")
+print(f"Using device: {DEVICE} | FedProx mu={MU}")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
-    test_dataset = IMUDataset(
-        test_csv, 
-        config["window_size"], 
-        config["input_dim"], 
-        config["window_shift"]
-    )
+    test_dataset = IMUDataset(test_csv, config["window_size"], config["input_dim"], config["window_shift"])
     print(f"Test samples: {len(test_dataset)}")
     return None, test_dataset
 
-def split_train_data(train_csv, num_clients=NUM_CLIENTS, 
-                     save_file="subject_split.json", seed=42):
+def split_train_data(train_csv, num_clients=NUM_CLIENTS, save_file="subject_split.json", seed=42):
     df = pd.read_csv(train_csv)
     subjects = sorted(df["subject"].unique())
     print(f"Total Subjects: {len(subjects)}")
 
     if os.path.exists(save_file):
-        print(f"Loading existing subject split from {save_file}")
         with open(save_file, "r") as f:
             client_subjects = json.load(f)
     else:
-        print(f"Creating new subject split and saving to {save_file}")
         np.random.seed(seed)
         np.random.shuffle(subjects)
         groups = np.array_split(subjects, num_clients)
@@ -61,27 +54,19 @@ def split_train_data(train_csv, num_clients=NUM_CLIENTS,
     client_datasets = []
     for cid in range(num_clients):
         group = client_subjects[str(cid)]
-        client_ds = IMUDataset(
-            train_csv,
-            config["window_size"],
-            config["input_dim"],
-            config["window_shift"],
-            subject_ids=group
-        )
+        client_ds = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"], subject_ids=group)
         client_datasets.append(client_ds)
         print(f"Client {cid} → {len(group)} subjects | {len(client_ds)} windows")
     return client_datasets
 
-# ====================== CLIENT ======================
+# ====================== CLIENT with FedProx ======================
 class IMUClient(fl.client.NumPyClient):
     def __init__(self, train_subset):
         self.model = IMUTransformerEncoder(config).to(DEVICE)
-        self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"],
-                                       shuffle=True, num_workers=0)
-        self.optimizer = torch.optim.Adam(self.model.parameters(),
-                                          lr=config["lr"],
-                                          weight_decay=config.get("weight_decay", 1e-4))
+        self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"]*0.5, weight_decay=config.get("weight_decay", 1e-4))
         self.criterion = torch.nn.NLLLoss()
+        self.global_params = None  # Will store global model for proximal term
 
     def get_parameters(self, config=None):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -93,21 +78,32 @@ class IMUClient(fl.client.NumPyClient):
             params_ndarrays = parameters
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params_ndarrays)}
         self.model.load_state_dict(state_dict, strict=True)
+        self.global_params = [p.clone() for p in self.model.parameters()]  # Save for proximal
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         self.model.train()
         total_loss = 0.0
+
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
+
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
                 loss = self.criterion(output, label)
+
+                # === FedProx Proximal Term ===
+                proximal_term = 0.0
+                for p, g_p in zip(self.model.parameters(), self.global_params):
+                    proximal_term += (MU / 2) * torch.norm(p - g_p) ** 2
+                loss += proximal_term
+
                 loss.backward()
                 self.optimizer.step()
                 total_loss += loss.item()
+
         return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
 
 # ====================== GLOBAL EVALUATION ======================
@@ -127,10 +123,8 @@ def evaluate_global(model, test_loader):
     precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
     recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
     f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-    cm = confusion_matrix(all_labels, all_preds)
-    report = classification_report(all_labels, all_preds, digits=4, zero_division=0)
 
-    return accuracy, precision, recall, f1, cm, report
+    return accuracy, precision, recall, f1
 
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
@@ -138,8 +132,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
-        self.model_size = sum(p.numel() * p.element_size() for p in self.global_model.parameters())
-        self.total_upload = self.total_download = self.total_comm_time = 0
 
     def aggregate_fit(self, server_round, results, failures):
         aggregated = super().aggregate_fit(server_round, results, failures)
@@ -151,9 +143,8 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         state_dict = {k: torch.tensor(v) for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)}
         self.global_model.load_state_dict(state_dict)
 
-        # Global Evaluation
-        accuracy, precision, recall, f1, cm, report = evaluate_global(self.global_model, self.test_loader)
-        print(f"\nRound {server_round} - Global Accuracy: {accuracy:.4f}")
+        accuracy, precision, recall, f1 = evaluate_global(self.global_model, self.test_loader)
+        print(f"\nRound {server_round} - Global Accuracy: {accuracy:.4f} | F1: {f1:.4f}")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL RESULTS ==========")
@@ -161,7 +152,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             print(f"Precision: {precision:.4f}")
             print(f"Recall   : {recall:.4f}")
             print(f"F1 Score : {f1:.4f}")
-            print("\nClassification Report:\n", report)
             torch.save(self.global_model.state_dict(), "final_global_model.pth")
 
         return aggregated
@@ -178,24 +168,20 @@ def main(train_csv: str, test_csv: str):
             cid = int(context.node_id)
         else:
             cid = int(context)
-        
-        # Critical safety fix
         if cid >= len(client_datasets):
             cid = cid % len(client_datasets)
-        
-        print(f"Client {cid} requested")  # for debugging
         return IMUClient(client_datasets[cid]).to_client()
 
     strategy = SaveModelStrategy(test_loader=test_loader)
 
-    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
+    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds | LOCAL_EPOCHS={LOCAL_EPOCHS}\n")
 
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.1 if torch.cuda.is_available() else 0},
+        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
     )
 
 
