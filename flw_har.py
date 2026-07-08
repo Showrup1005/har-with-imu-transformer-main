@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import json
 from torch.utils.data import DataLoader, Subset
+from flwr.common import Context
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -84,6 +85,30 @@ class IMUClient(fl.client.NumPyClient):
                 total_loss += loss.item()
 
         return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
+    
+    def evaluate(self, parameters, config):
+        self.set_parameters(parameters)
+        self.model.eval()
+        
+        correct, total = 0, 0
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in self.train_loader:   # or create a separate val_loader
+                imu = batch["imu"].to(DEVICE).float()
+                label = batch["label"].to(DEVICE).long()
+                output = self.model({"imu": imu})
+                loss = self.criterion(output, label)
+                total_loss += loss.item()
+                
+                pred = output.argmax(dim=1)
+                correct += (pred == label).sum().item()
+                total += label.size(0)
+        
+        accuracy = correct / total if total > 0 else 0.0
+        loss_avg = total_loss / len(self.train_loader) if len(self.train_loader) > 0 else 0.0
+        
+        return float(loss_avg), len(self.train_loader.dataset), {"accuracy": accuracy}
 
 # ====================== GLOBAL EVALUATION ======================
 def evaluate_global(model, test_loader):
@@ -138,7 +163,10 @@ def main(train_csv: str, test_csv: str):
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    def client_fn(cid: str):
+    from flwr.common import Context
+
+    def client_fn(context: Context):
+        cid = context.node_config["cid"] if "cid" in context.node_config else context.node_id
         return IMUClient(client_datasets[int(cid)]).to_client()
 
     strategy = SaveModelStrategy(
@@ -155,7 +183,7 @@ def main(train_csv: str, test_csv: str):
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.1 if torch.cuda.is_available() else 0},
+        client_resources={"num_cpus": 1, "num_gpus": 0},
     )
 
     print(f"\nFinished! Best Accuracy: {strategy.best_acc:.4f}")
