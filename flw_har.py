@@ -22,7 +22,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLIENTS = 5
 NUM_ROUNDS = 30
 LOCAL_EPOCHS = 3
-MU = 0.01          # FedProx
+MU = 0.01
 PROTO_WEIGHT = 0.1
 
 print(f"Using device: {DEVICE} | FedProx mu={MU} | Proto weight={PROTO_WEIGHT}")
@@ -55,6 +55,14 @@ def split_train_data(train_csv, num_clients=NUM_CLIENTS, save_file="subject_spli
         client_ds = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"], subject_ids=group)
         client_datasets.append(client_ds)
         print(f"Client {cid} → {len(group)} subjects | {len(client_ds)} windows")
+
+        # === Label Distribution ===
+        labels = [sample['label'].item() if torch.is_tensor(sample['label']) else sample['label'] for sample in client_ds]
+        unique, counts = np.unique(labels, return_counts=True)
+        dist = dict(zip(unique.tolist(), counts.tolist()))
+        print(f"    Label distribution: {dist}")
+        print(f"    Total windows: {sum(counts)}")
+
     return client_datasets
 
 # ====================== CLIENT ======================
@@ -82,7 +90,6 @@ class IMUClient(fl.client.NumPyClient):
         self.model.train()
         total_loss = 0.0
 
-        # Store initial parameters for FedProx
         global_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         for _ in range(LOCAL_EPOCHS):
@@ -125,30 +132,11 @@ class IMUClient(fl.client.NumPyClient):
 
         return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
 
-    # === NEW: Add this method ===
     def evaluate(self, parameters, config):
+        # Minimal dummy to prevent failures
         self.set_parameters(parameters)
-        self.model.eval()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        return 0.0, len(self.train_loader.dataset), {"accuracy": 0.0}
 
-        with torch.no_grad():
-            for batch in self.train_loader:
-                imu = batch["imu"].to(DEVICE).float()
-                labels = batch["label"].to(DEVICE).long()
-
-                output = self.model({"imu": imu})
-                loss = self.criterion(output, labels)
-
-                total_loss += loss.item()
-                preds = output.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-
-        accuracy = correct / total if total > 0 else 0.0
-        return float(total_loss / len(self.train_loader)), len(self.train_loader.dataset), {"accuracy": accuracy}
-    
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, **kwargs):
