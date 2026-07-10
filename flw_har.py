@@ -148,6 +148,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
+        self.preprocessor = IMUPreprocessor(fs=50.0)
 
     def aggregate_fit(self, server_round, results, failures):
         aggregated = super().aggregate_fit(server_round, results, failures)
