@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
+from util.IMUPreprocess import IMUPreprocessor
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 # ====================== CONFIG ======================
@@ -73,6 +74,7 @@ class IMUClient(fl.client.NumPyClient):
         self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"] * 0.5)
         self.criterion = torch.nn.NLLLoss()
+        self.preprocessor = IMUPreprocessor(fs=50.0)  
 
     def get_parameters(self, config=None):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -95,6 +97,9 @@ class IMUClient(fl.client.NumPyClient):
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
                 imu = batch["imu"].to(DEVICE).float()
+                batch["imu"] = imu  # ensure key exists
+                batch = self.preprocessor(batch)
+                imu = batch["imu"]
                 labels = batch["label"].to(DEVICE).long()
 
                 features = self.model.get_features({"imu": imu})
@@ -169,6 +174,9 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         with torch.no_grad():
             for batch in self.test_loader:
                 imu = batch["imu"].to(DEVICE).float()
+                batch["imu"] = imu  # ensure key exists
+                batch = self.preprocessor(batch)
+                imu = batch["imu"]
                 labels = batch["label"].to(DEVICE).long()
                 output = self.global_model({"imu": imu})
                 preds = output.argmax(dim=1)
