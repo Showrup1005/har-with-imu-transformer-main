@@ -5,7 +5,7 @@ import warnings
 import os
 import pandas as pd
 import json
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader
 
 warnings.filterwarnings("ignore")
@@ -22,7 +22,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLIENTS = 5
 NUM_ROUNDS = 30
 LOCAL_EPOCHS = 3
-MU = 0.01
+MU = 0.01          # FedProx
 PROTO_WEIGHT = 0.1
 
 print(f"Using device: {DEVICE} | FedProx mu={MU} | Proto weight={PROTO_WEIGHT}")
@@ -59,12 +59,13 @@ def split_train_data(train_csv, num_clients=NUM_CLIENTS, save_file="subject_spli
 
 # ====================== CLIENT ======================
 class IMUClient(fl.client.NumPyClient):
-    def __init__(self, train_subset, client_id):
+    def __init__(self, train_subset, client_id, global_params=None):
         self.client_id = client_id
         self.model = IMUTransformerEncoder(config).to(DEVICE)
         self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"] * 0.5)
         self.criterion = torch.nn.NLLLoss()
+        self.global_params = global_params  # for FedProx
 
     def get_parameters(self, config=None):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -82,6 +83,9 @@ class IMUClient(fl.client.NumPyClient):
         self.model.train()
         total_loss = 0.0
 
+        # Store initial parameters for FedProx
+        global_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
                 imu = batch["imu"].to(DEVICE).float()
@@ -92,13 +96,27 @@ class IMUClient(fl.client.NumPyClient):
 
                 ce_loss = self.criterion(output, labels)
 
-                # Simple prototype loss
+                # === Fixed Prototype Loss ===
                 proto_loss = 0.0
-                for i in range(len(labels)):
-                    proto_loss += torch.norm(features[i] - features[labels[i]], p=2)**2
-                proto_loss = proto_loss / len(labels)
+                if len(labels) > 1:
+                    unique_labels = torch.unique(labels)
+                    for lbl in unique_labels:
+                        mask = (labels == lbl)
+                        if mask.sum() > 1:
+                            class_features = features[mask]
+                            prototype = class_features.mean(dim=0)
+                            proto_loss += torch.norm(class_features - prototype, p=2, dim=1).mean()
 
-                loss = ce_loss + PROTO_WEIGHT * proto_loss
+                proto_loss = proto_loss / max(1, len(unique_labels))
+
+                # === FedProx Term ===
+                prox_loss = 0.0
+                for k, v in self.model.state_dict().items():
+                    if k in global_state:
+                        prox_loss += torch.norm(v - global_state[k], p=2)**2
+                prox_loss = MU * prox_loss
+
+                loss = ce_loss + PROTO_WEIGHT * proto_loss + prox_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -125,7 +143,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         state_dict = {k: torch.tensor(v) for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)}
         self.global_model.load_state_dict(state_dict)
 
-        # Global Evaluation
         accuracy = self.evaluate_global()
         print(f"\nRound {server_round} - Global Accuracy: {accuracy:.4f}")
 
