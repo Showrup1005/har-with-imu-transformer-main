@@ -14,4 +14,5 @@ class IMUPreprocessor:
         imu_norm = (imu - mean) / std
         
         batch["imu"] = imu_norm
+        print(batch)
         return batch

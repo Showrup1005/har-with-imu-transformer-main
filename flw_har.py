@@ -30,17 +30,36 @@ def load_data(train_csv: str, test_csv: str):
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
 
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS):
+def split_train_data(train_dataset, num_clients=NUM_CLIENTS, save_file="client_split.json", seed=42):
     n = len(train_dataset)
     indices = np.arange(n)
+ 
+    np.random.seed(seed)
     np.random.shuffle(indices)
+    
     client_datasets = []
     size = n // num_clients
+    
+    print(f"\n=== Client Data Distribution (Seed={seed}) ===")
+    
     for i in range(num_clients):
         start = i * size
         end = start + size if i < num_clients - 1 else n
         subset = Subset(train_dataset, indices[start:end])
         client_datasets.append(subset)
+        
+        labels = []
+        for idx in indices[start:end]:
+            sample = train_dataset[idx]
+            label = sample['label'].item() if torch.is_tensor(sample['label']) else sample['label']
+            labels.append(label)
+        
+        unique, counts = np.unique(labels, return_counts=True)
+        dist = dict(zip(unique.tolist(), counts.tolist()))
+        
+        print(f"Client {i} → {len(subset)} samples | Label distribution: {dist}")
+    
+    print("="*60)
     return client_datasets
 
 # ====================== CLIENT ======================
@@ -149,7 +168,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(train_dataset)
+    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
