@@ -173,14 +173,16 @@ def main(train_csv: str, test_csv: str):
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     def client_fn(context):
+  
         if hasattr(context, "node_id"):
             cid = int(context.node_id)
         elif hasattr(context, "node_config") and "cid" in context.node_config:
             cid = int(context.node_config["cid"])
         else:
             cid = 0
-
-        client_idx = cid % len(client_datasets)
+        
+        client_idx = cid % len(client_datasets)   
+        
         return IMUClient(client_datasets[client_idx]).to_client()
 
     strategy = SaveModelStrategy(test_loader=test_loader)
