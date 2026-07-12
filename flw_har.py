@@ -9,6 +9,7 @@ warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
+from util.IMUPreprocessing import IMUPreprocessor
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 # ====================== CONFIG ======================
@@ -54,6 +55,7 @@ class IMUClient(fl.client.NumPyClient):
                                           lr=config["lr"],
                                           weight_decay=config.get("weight_decay", 1e-4))
         self.criterion = torch.nn.NLLLoss()
+        self.preprocessor = IMUPreprocessor(fs=50.0)
 
     def get_parameters(self, config=None):
         """Return parameters as list of numpy arrays"""
@@ -75,6 +77,7 @@ class IMUClient(fl.client.NumPyClient):
         total_loss = 0.0
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
+                batch = self.preprocessor(batch)
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
                 self.optimizer.zero_grad()
@@ -94,7 +97,8 @@ class IMUClient(fl.client.NumPyClient):
         total_loss = 0.0
         
         with torch.no_grad():
-            for batch in self.train_loader:   # or create a separate val_loader
+            for batch in self.train_loader:   
+                batch = self.preprocessor(batch)
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
                 output = self.model({"imu": imu})
