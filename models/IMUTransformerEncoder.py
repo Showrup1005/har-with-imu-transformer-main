@@ -28,7 +28,9 @@ class IMUTransformerEncoder(nn.Module):
                                        nhead = config.get("nhead"),
                                        dim_feedforward = config.get("dim_feedforward"),
                                        dropout = config.get("transformer_dropout"),
-                                       activation = config.get("transformer_activation"))
+                                       activation = config.get("transformer_activation"),
+                                       batch_first=True, 
+                                       norm_first=True)
 
         self.transformer_encoder = TransformerEncoder(encoder_layer,
                                               num_layers = config.get("num_encoder_layers"),

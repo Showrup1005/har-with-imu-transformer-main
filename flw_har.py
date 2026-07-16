@@ -18,8 +18,8 @@ with open('config.json', 'r') as f:
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLIENTS = 3
-NUM_ROUNDS = 5
-LOCAL_EPOCHS = 1
+LOCAL_EPOCHS = 5
+NUM_ROUNDS = 20
 
 print(f"Using device: {DEVICE}")
 

@@ -20,7 +20,7 @@ class IMUPreprocessor:
                 filtered[i, :, j] = filtfilt(b, a, accel_np[i, :, j])
         return torch.from_numpy(filtered).float().to(accel.device)
 
-    def wavelet_denoise(self, x, wavelet='db4', level=3):
+    def wavelet_denoise(self, x, wavelet='db4', level=2):  
         x_np = x.cpu().numpy()
         denoised = np.zeros_like(x_np)
         for i in range(x_np.shape[0]):
