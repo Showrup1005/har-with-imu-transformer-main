@@ -89,8 +89,9 @@ class IMUClient(fl.client.NumPyClient):
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
-                # batch = self.preprocessor(batch)
-                imu = batch["imu"].to(DEVICE)
+                # batch = self.preprocessor(batch)   # uncomment later when stable
+                
+                imu = batch["imu"].to(DEVICE).float()      # ← Force float32
                 label = batch["label"].to(DEVICE).long()
 
                 self.optimizer.zero_grad()
@@ -101,16 +102,15 @@ class IMUClient(fl.client.NumPyClient):
                 total_loss += loss.item()
 
         return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
-
+    
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
         correct, total = 0, 0
 
         with torch.no_grad():
-            for batch in self.train_loader:   # Temporarily keep train for speed, but better to have test subset
-                # batch = self.preprocessor(batch)
-                imu = batch["imu"].to(DEVICE)
+            for batch in self.train_loader:   # Use test_loader for real eval later
+                imu = batch["imu"].to(DEVICE).float()      # ← Force float32
                 label = batch["label"].to(DEVICE).long()
 
                 output = self.model({"imu": imu})
@@ -119,7 +119,8 @@ class IMUClient(fl.client.NumPyClient):
                 total += label.size(0)
 
         accuracy = correct / total if total > 0 else 0.0
-        return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}  # loss=0.0 is fine
+        return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}
+    
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, **kwargs):
@@ -152,8 +153,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         correct, total = 0, 0
         with torch.no_grad():
             for batch in self.test_loader:
-                # batch = self.preprocessor(batch)
-                imu = batch["imu"].to(DEVICE)
+                imu = batch["imu"].to(DEVICE).float()      # ← Add this
                 label = batch["label"].to(DEVICE).long()
                 output = self.global_model({"imu": imu})
                 pred = output.argmax(dim=1)
