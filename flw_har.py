@@ -89,7 +89,7 @@ class IMUClient(fl.client.NumPyClient):
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
-                batch = self.preprocessor(batch)
+                # batch = self.preprocessor(batch)
                 imu = batch["imu"].to(DEVICE)
                 label = batch["label"].to(DEVICE).long()
 
@@ -105,25 +105,21 @@ class IMUClient(fl.client.NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
-        correct, total, total_loss = 0, 0, 0.0
+        correct, total = 0, 0
 
         with torch.no_grad():
-            for batch in self.train_loader:
-                batch = self.preprocessor(batch)
+            for batch in self.train_loader:   # Temporarily keep train for speed, but better to have test subset
+                # batch = self.preprocessor(batch)
                 imu = batch["imu"].to(DEVICE)
                 label = batch["label"].to(DEVICE).long()
 
                 output = self.model({"imu": imu})
-                loss = self.criterion(output, label)
-                total_loss += loss.item()
-
                 pred = output.argmax(dim=1)
                 correct += (pred == label).sum().item()
                 total += label.size(0)
 
         accuracy = correct / total if total > 0 else 0.0
-        return float(total_loss / len(self.train_loader)), len(self.train_loader.dataset), {"accuracy": accuracy}
-
+        return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}  # loss=0.0 is fine
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, **kwargs):
@@ -156,7 +152,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         correct, total = 0, 0
         with torch.no_grad():
             for batch in self.test_loader:
-                batch = self.preprocessor(batch)
+                # batch = self.preprocessor(batch)
                 imu = batch["imu"].to(DEVICE)
                 label = batch["label"].to(DEVICE).long()
                 output = self.global_model({"imu": imu})

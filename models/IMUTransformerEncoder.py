@@ -30,7 +30,7 @@ class IMUTransformerEncoder(nn.Module):
                                        dropout = config.get("transformer_dropout"),
                                        activation = config.get("transformer_activation"),
                                        batch_first=True, 
-                                       norm_first=True)
+                                       norm_first=False)
 
         self.transformer_encoder = TransformerEncoder(encoder_layer,
                                               num_layers = config.get("num_encoder_layers"),

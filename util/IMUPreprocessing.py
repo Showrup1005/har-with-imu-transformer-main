@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-import pywt  # PyWavelets
+import pywt  
 
 class IMUPreprocessor:
     def __init__(self, fs=100.0, cutoff=0.3):
