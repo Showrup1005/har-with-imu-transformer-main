@@ -4,6 +4,9 @@ import numpy as np
 import json
 import warnings
 from torch.utils.data import DataLoader, Subset
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
@@ -68,7 +71,7 @@ class IMUClient(fl.client.NumPyClient):
         self.model = IMUTransformerEncoder(config).to(DEVICE)
         self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 1e-4))
-        self.criterion = torch.nn.NLLLoss()
+        self.criterion = torch.nn.CrossEntropyLoss()
         self.preprocessor = IMUPreprocessor(fs=100.0)
 
     def get_parameters(self, config=None):
@@ -106,19 +109,21 @@ class IMUClient(fl.client.NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
-        correct, total = 0, 0
+        all_preds = []
+        all_labels = []
 
         with torch.no_grad():
-            for batch in self.train_loader:   # Use test_loader for real eval later
-                imu = batch["imu"].to(DEVICE).float()      # ← Force float32
+            for batch in self.train_loader:   # Change to test_loader later
+                imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
 
                 output = self.model({"imu": imu})
                 pred = output.argmax(dim=1)
-                correct += (pred == label).sum().item()
-                total += label.size(0)
 
-        accuracy = correct / total if total > 0 else 0.0
+                all_preds.extend(pred.cpu().numpy())
+                all_labels.extend(label.cpu().numpy())
+
+        accuracy = accuracy_score(all_labels, all_preds)
         return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}
     
 # ====================== STRATEGY ======================
@@ -131,6 +136,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.best_acc = 0.0
 
     def aggregate_fit(self, server_round, results, failures):
+        self.current_round = server_round
         aggregated = super().aggregate_fit(server_round, results, failures)
         if aggregated is None:
             return aggregated
@@ -150,16 +156,55 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
     def evaluate_global(self):
         self.global_model.eval()
-        correct, total = 0, 0
+        all_preds = []
+        all_labels = []
+
         with torch.no_grad():
             for batch in self.test_loader:
-                imu = batch["imu"].to(DEVICE).float()      # ← Add this
-                label = batch["label"].to(DEVICE).long()
+                imu = batch["imu"].to(DEVICE).float()
+                labels = batch["label"].to(DEVICE).long()
+
                 output = self.global_model({"imu": imu})
-                pred = output.argmax(dim=1)
-                correct += (pred == label).sum().item()
-                total += label.size(0)
-        return correct / total if total > 0 else 0.0
+                preds = output.argmax(dim=1)
+
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+
+        print(f"\n{'='*30}")
+        print(f"Round {self.current_round if hasattr(self, 'current_round') else 'Global'} Evaluation")
+        print(f"{'='*30}")
+        print(f"Accuracy : {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall   : {recall:.4f}")
+        print(f"F1 Score : {f1:.4f}")
+
+        # Classification Report
+        print("\nClassification Report")
+        print(classification_report(all_labels, all_preds, zero_division=0))
+
+        # Confusion Matrix
+        cm = confusion_matrix(all_labels, all_preds)
+        print("\nConfusion Matrix")
+        print(cm)
+
+        # Optional: Save confusion matrix plot
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.savefig(f'confusion_matrix_round_{getattr(self, "current_round", 0)}.png')
+        plt.close()
+
+        return accuracy
 
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
