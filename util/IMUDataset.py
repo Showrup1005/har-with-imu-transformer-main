@@ -26,8 +26,8 @@ class IMUDataset(Dataset):
         if df.shape[1] == 1:
             df = pd.read_csv(imu_dataset_file, delimiter='\t')
         # Fetch the flatten IMU data and labels
-        self.imu = df.iloc[:, :input_size].values
-        self.labels = df.iloc[:, input_size:].values
+        self.imu = df.iloc[:, :input_size].values.astype(np.float32)
+        self.labels = df.iloc[:, input_size:].values.astype(np.int64)
         n = self.labels.shape[0]
         self.start_indices = list(range(0, n - window_size + 1, window_shift))
         self.window_size = window_size
