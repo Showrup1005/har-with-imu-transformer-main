@@ -52,7 +52,7 @@ class IMUTransformerEncoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(self.transformer_dim // 4, num_classes)
         )
-        self.log_softmax = nn.LogSoftmax(dim=1)
+        # self.log_softmax = nn.LogSoftmax(dim=1)
 
         # init
         for p in self.parameters():
@@ -77,20 +77,19 @@ class IMUTransformerEncoder(nn.Module):
 
         return features
 
-    def forward(self, data):
-        src = data.get('imu')  # N x S x C
-        src = self.input_proj(src.transpose(1, 2)).permute(2, 0, 1)
+def forward(self, data):
+    src = data.get('imu')  # N x S x C
+    src = self.input_proj(src.transpose(1, 2)).permute(2, 0, 1)
 
-        cls_token = self.cls_token.unsqueeze(1).repeat(1, src.shape[1], 1)
-        src = torch.cat([cls_token, src])
+    cls_token = self.cls_token.unsqueeze(1).repeat(1, src.shape[1], 1)
+    src = torch.cat([cls_token, src])
 
-        if self.encode_position:
-            src += self.position_embed
+    if self.encode_position:
+        src += self.position_embed
 
-        target = self.transformer_encoder(src)[0]   # CLS token
-
-        logits = self.imu_head(target)              # Raw logits
-        return logits                                   # ← No log_softmax here if using CrossEntropyLoss
+    target = self.transformer_encoder(src)[0]   # CLS token
+    logits = self.imu_head(target)
+    return logits   # raw logits — CrossEntropyLoss applies log_softmax internally                                 # ← No log_softmax here if using CrossEntropyLoss
 
 
 def get_activation(activation):

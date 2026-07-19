@@ -64,7 +64,8 @@ if __name__ == "__main__":
         model.train()
 
         # Set the loss
-        loss = torch.nn.NLLLoss()
+        # loss = torch.nn.NLLLoss()
+        loss = torch.nn.CrossEntropyLoss()
 
         # Set the optimizer and scheduler
         optim = torch.optim.Adam(model.parameters(),
