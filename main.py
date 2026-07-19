@@ -102,35 +102,32 @@ if __name__ == "__main__":
         for epoch in range(n_epochs):
 
             for batch_idx, minibatch in enumerate(dataloader):
-                minibatch["imu"] = minibatch["imu"].to(device).to(dtype=torch.float32)
-                label = minibatch.get('label').to(device).to(dtype=torch.long)
+                # Force correct dtype and format
+                imu = minibatch["imu"].to(device).float()
+                label = minibatch.get('label').to(device).long()
+                
                 batch_size = label.shape[0]
-
                 n_total_samples += batch_size
 
-                # Zero the gradients
                 optim.zero_grad()
 
-                # Forward pass
-                res = model(minibatch)
+                # Forward pass with proper dict
+                res = model({"imu": imu})
 
-                # Compute loss
                 criterion = loss(res, label)
-
-                # Collect for recoding and plotting
                 batch_loss = criterion.item()
-                loss_vals.append(batch_loss)
-                sample_count.append(n_total_samples)
 
-                # Back prop
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 criterion.backward()
                 optim.step()
 
-                # Record loss on train set
+                loss_vals.append(batch_loss)
+                sample_count.append(n_total_samples)
+
                 if batch_idx % n_freq_print == 0:
-                    logging.info("[Batch-{}/Epoch-{}] batch loss: {:.3f}".format(
-                                                                        batch_idx+1, epoch+1,
-                                                                        batch_loss))
+                    logging.info(f"[Batch-{batch_idx+1}/Epoch-{epoch+1}] batch loss: {batch_loss:.4f}")
             # Save checkpoint
             if (epoch % n_freq_checkpoint) == 0 and epoch > 0:
                 torch.save(model.state_dict(), checkpoint_prefix + '_checkpoint-{}.pth'.format(epoch))

@@ -78,25 +78,19 @@ class IMUTransformerEncoder(nn.Module):
         return features
 
     def forward(self, data):
-        src = data.get('imu')  # Shape N x S x C
-
-        # Embed
+        src = data.get('imu')  # N x S x C
         src = self.input_proj(src.transpose(1, 2)).permute(2, 0, 1)
 
-        # Prepend class token
         cls_token = self.cls_token.unsqueeze(1).repeat(1, src.shape[1], 1)
         src = torch.cat([cls_token, src])
 
-        # Add position embedding
         if self.encode_position:
             src += self.position_embed
 
-        # Transformer Encoder pass
-        target = self.transformer_encoder(src)[0]
+        target = self.transformer_encoder(src)[0]   # CLS token
 
-        # Class probability
-        target = self.log_softmax(self.imu_head(target))
-        return target
+        logits = self.imu_head(target)              # Raw logits
+        return logits                                   # ← No log_softmax here if using CrossEntropyLoss
 
 
 def get_activation(activation):
