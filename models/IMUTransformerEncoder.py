@@ -36,10 +36,10 @@ class IMUTransformerEncoder(nn.Module):
                                               num_layers = config.get("num_encoder_layers"),
                                               norm = nn.LayerNorm(self.transformer_dim))
         self.cls_token = nn.Parameter(torch.zeros((1, self.transformer_dim)), requires_grad=True)
-        self.position_embed = nn.Parameter(torch.randn(1, self.window_size + 1, self.transformer_dim))
+        
 
         if self.encode_position:
-            self.position_embed = nn.Parameter(torch.randn(self.window_size + 1, 1, self.transformer_dim))
+            self.position_embed = nn.Parameter(torch.randn(1, self.window_size + 1, self.transformer_dim))
 
         num_classes =  config.get("num_classes")
         self.imu_head = nn.Sequential(
