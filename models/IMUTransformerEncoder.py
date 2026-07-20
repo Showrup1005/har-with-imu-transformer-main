@@ -36,6 +36,7 @@ class IMUTransformerEncoder(nn.Module):
                                               num_layers = config.get("num_encoder_layers"),
                                               norm = nn.LayerNorm(self.transformer_dim))
         self.cls_token = nn.Parameter(torch.zeros((1, self.transformer_dim)), requires_grad=True)
+        self.position_embed = nn.Parameter(torch.randn(1, self.window_size + 1, self.transformer_dim))
 
         if self.encode_position:
             self.position_embed = nn.Parameter(torch.randn(self.window_size + 1, 1, self.transformer_dim))
@@ -48,7 +49,6 @@ class IMUTransformerEncoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(self.transformer_dim//4,  num_classes)
         )
-        self.log_softmax = nn.LogSoftmax(dim=1)
 
         # init
         for p in self.parameters():
@@ -56,25 +56,20 @@ class IMUTransformerEncoder(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, data):
-        src = data.get('imu')  # Shape N x S x C with S = sequence length, N = batch size, C = channels
+        src = data.get('imu')                              # (N, S, C)
+        src = self.input_proj(src.transpose(1, 2))          # (N, transformer_dim, S)
+        src = src.transpose(1, 2)                           # (N, S, transformer_dim)  batch-first
 
-        # Embed in a high dimensional space and reshape to Transformer's expected shape
-        src = self.input_proj(src.transpose(1, 2)).permute(2, 0, 1)
+        cls_token = self.cls_token.unsqueeze(0).expand(src.shape[0], -1, -1)  # (N, 1, C)
+        src = torch.cat([cls_token, src], dim=1)            # (N, S+1, C)
 
-        # Prepend class token
-        cls_token = self.cls_token.unsqueeze(1).repeat(1, src.shape[1], 1)
-        src = torch.cat([cls_token, src])
-
-        # Add the position embedding
         if self.encode_position:
-            src += self.position_embed
+            src = src + self.position_embed                 # (1, S+1, C) broadcasts over N
 
-        # Transformer Encoder pass
-        target = self.transformer_encoder(src)[0]
-
-        # Class probability
-        target = self.log_softmax(self.imu_head(target))
-        return target
+        target = self.transformer_encoder(src)               # (N, S+1, C)
+        target = target[:, 0, :]                              # CLS token — batch dim0, seq dim1
+        logits = self.imu_head(target)
+        return logits
 
 def get_activation(activation):
     """Return an activation function given a string"""

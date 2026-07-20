@@ -94,7 +94,7 @@ class IMUClient(fl.client.NumPyClient):
             for batch in self.train_loader:
                 # batch = self.preprocessor(batch)   # uncomment later when stable
                 
-                imu = batch["imu"].to(DEVICE).float()      # ← Force float32
+                imu = batch["imu"].to(DEVICE).float()   
                 label = batch["label"].to(DEVICE).long()
 
                 self.optimizer.zero_grad()
@@ -113,7 +113,7 @@ class IMUClient(fl.client.NumPyClient):
         all_labels = []
 
         with torch.no_grad():
-            for batch in self.train_loader:   # Change to test_loader later
+            for batch in self.test_loader:  
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
 
