@@ -138,24 +138,37 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
         aggregated = super().aggregate_fit(server_round, results, failures)
+
         if aggregated is None:
             return aggregated
 
         parameters, _ = aggregated
         params_ndarrays = parameters_to_ndarrays(parameters)
-        state_dict = {k: torch.tensor(v) for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)}
+
+        state_dict = {
+            k: torch.tensor(v)
+            for k, v in zip(self.global_model.state_dict().keys(), params_ndarrays)
+        }
         self.global_model.load_state_dict(state_dict, strict=True)
 
-        acc = self.evaluate_global()
-        print(f"Round {server_round} - Global Accuracy: {acc:.4f}")
+        # Accuracy after every round
+        acc = self.evaluate_global(final=False)
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f}")
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), f"best_model_r{server_round}.pth")
+            torch.save(self.global_model.state_dict(), "best_model.pth")
+
+        # Final evaluation after last round
+        if server_round == NUM_ROUNDS:
+            print("\n========== FINAL EVALUATION ==========")
+            self.evaluate_global(final=True)
+
         return aggregated
 
-    def evaluate_global(self):
+    def evaluate_global(self, final=False):
         self.global_model.eval()
+
         all_preds = []
         all_labels = []
 
@@ -164,8 +177,8 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
                 imu = batch["imu"].to(DEVICE).float()
                 labels = batch["label"].to(DEVICE).long()
 
-                output = self.global_model({"imu": imu})
-                preds = output.argmax(dim=1)
+                outputs = self.global_model({"imu": imu})
+                preds = outputs.argmax(dim=1)
 
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
@@ -174,34 +187,52 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         all_labels = np.array(all_labels)
 
         accuracy = accuracy_score(all_labels, all_preds)
-        precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
-        recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
-        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
 
-        print(f"\n{'='*30}")
-        print(f"Round {self.current_round if hasattr(self, 'current_round') else 'Global'} Evaluation")
-        print(f"{'='*30}")
+        # During training rounds, return only accuracy
+        if not final:
+            return accuracy
+
+        # Only after final round
+        precision = precision_score(
+            all_labels,
+            all_preds,
+            average="weighted",
+            zero_division=0,
+        )
+
+        recall = recall_score(
+            all_labels,
+            all_preds,
+            average="weighted",
+            zero_division=0,
+        )
+
+        f1 = f1_score(
+            all_labels,
+            all_preds,
+            average="weighted",
+            zero_division=0,
+        )
+
         print(f"Accuracy : {accuracy:.4f}")
         print(f"Precision: {precision:.4f}")
         print(f"Recall   : {recall:.4f}")
         print(f"F1 Score : {f1:.4f}")
 
-        # Classification Report
         print("\nClassification Report")
         print(classification_report(all_labels, all_preds, zero_division=0))
 
-        # Confusion Matrix
         cm = confusion_matrix(all_labels, all_preds)
+
         print("\nConfusion Matrix")
         print(cm)
 
-        # Optional: Save confusion matrix plot
         plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-        plt.title('Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.savefig(f'confusion_matrix_round_{getattr(self, "current_round", 0)}.png')
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+        plt.title("Final Confusion Matrix")
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.savefig("final_confusion_matrix.png")
         plt.close()
 
         return accuracy
