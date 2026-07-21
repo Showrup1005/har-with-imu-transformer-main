@@ -12,7 +12,6 @@ warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
-from util.IMUPreprocessing import IMUPreprocessor
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 # ====================== CONFIG ======================
@@ -72,7 +71,6 @@ class IMUClient(fl.client.NumPyClient):
         self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 1e-4))
         self.criterion = torch.nn.CrossEntropyLoss()
-        self.preprocessor = IMUPreprocessor(fs=100.0)
 
     def get_parameters(self, config=None):
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
@@ -92,7 +90,6 @@ class IMUClient(fl.client.NumPyClient):
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
-                # batch = self.preprocessor(batch)   # uncomment later when stable
                 
                 imu = batch["imu"].to(DEVICE).float()   
                 label = batch["label"].to(DEVICE).long()
@@ -132,7 +129,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
-        self.preprocessor = IMUPreprocessor(fs=100.0)
         self.best_acc = 0.0
 
     def aggregate_fit(self, server_round, results, failures):
