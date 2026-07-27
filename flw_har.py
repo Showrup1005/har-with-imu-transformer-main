@@ -30,7 +30,7 @@ NUM_ROUNDS = 40
 print(f"Using device: {DEVICE}")
 
 # ============================================================
-#  communication cost measurement utilities
+# communication cost measurement utilities
 # ============================================================
 def compute_ndarrays_size(ndarrays):
     """Total size in bytes of a list of numpy arrays, as they'll actually
@@ -50,6 +50,7 @@ def print_model_size_summary(model):
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Model size (fp32):    {size_bytes:,} bytes = {size_mb:.2f} MB")
+    print(f"Model size (fp16):    {size_bytes // 2:,} bytes = {size_mb / 2:.2f} MB  (expected with quantization)")
     print("=" * 60 + "\n")
     return size_bytes
 
@@ -60,7 +61,7 @@ class CommunicationTracker:
     upload   = client -> server (parameters returned from fit)
     """
     def __init__(self):
-        self.round_log = []  # list of dicts per round
+        self.round_log = []
         self.total_download_bytes = 0
         self.total_upload_bytes = 0
 
@@ -92,7 +93,7 @@ class CommunicationTracker:
             print(f"Average per round:                {avg_round/1024**2:.2f} MB")
         print("=" * 60 + "\n")
 
-    def save_csv(self, path="communication_log.csv"):
+    def save_csv(self, path="communication_log_fp16.csv"):
         import csv
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["round", "download_bytes", "upload_bytes", "total_bytes"])
@@ -102,6 +103,24 @@ class CommunicationTracker:
 
 
 comm_tracker = CommunicationTracker()
+
+# ============================================================
+# NEW: fp16 quantization helpers
+# ============================================================
+def quantize_to_fp16(ndarrays):
+    """Cast each array to float16 for transmission. Roughly halves the
+    byte size of every param tensor (compute_ndarrays_size will reflect
+    this automatically via arr.nbytes)."""
+    return [arr.astype(np.float16) for arr in ndarrays]
+
+
+def dequantize_to_fp32(ndarrays):
+    """Upcast back to float32. Training and aggregation stay in fp32 for
+    numerical stability — only the WIRE representation is fp16."""
+    return [arr.astype(np.float32) for arr in ndarrays]
+# ============================================================
+# END NEW BLOCK
+# ============================================================
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -151,18 +170,24 @@ class IMUClient(fl.client.NumPyClient):
         self.criterion = torch.nn.CrossEntropyLoss()
 
     def get_parameters(self, config=None):
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        # NEW: quantize to fp16 before this leaves the client (upload compression)
+        fp32_params = [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        return quantize_to_fp16(fp32_params)
 
     def set_parameters(self, parameters):
         if hasattr(parameters, "tensors"):
             params = parameters_to_ndarrays(parameters)
         else:
             params = parameters
+        # NEW: whatever precision arrived on the wire (fp16 from server),
+        # upcast to fp32 before loading into the model — training must
+        # stay in fp32 for stable gradients.
+        params = dequantize_to_fp32(params)
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
-        # measure download size (server -> this client) before training
+        # measure download size (server -> this client) exactly as received on the wire
         download_bytes = compute_ndarrays_size(parameters)
 
         self.set_parameters(parameters)
@@ -182,8 +207,7 @@ class IMUClient(fl.client.NumPyClient):
                 self.optimizer.step()
                 total_loss += loss.item()
 
-        updated_params = self.get_parameters()
-        # measure upload size (this client -> server)
+        updated_params = self.get_parameters()  # already fp16-quantized
         upload_bytes = compute_ndarrays_size(updated_params)
 
         return updated_params, len(self.train_loader.dataset), {
@@ -220,10 +244,21 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
 
+    def configure_fit(self, server_round, parameters, client_manager):
+        # NEW: quantize the outgoing global model to fp16 before it's
+        # distributed to clients (download compression). This is the
+        # ONLY place download compression needs to happen — every
+        # sampled client gets the same quantized parameters.
+        ndarrays = parameters_to_ndarrays(parameters)
+        quantized_ndarrays = quantize_to_fp16(ndarrays)
+        quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
+        return super().configure_fit(server_round, quantized_parameters, client_manager)
+
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
 
         # sum up actual download/upload bytes reported by each client this round
+        # (these already reflect fp16 wire sizes via compute_ndarrays_size)
         round_download = 0
         round_upload = 0
         for _, fit_res in results:
@@ -231,6 +266,16 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             round_download += metrics.get("download_bytes", 0)
             round_upload += metrics.get("upload_bytes", 0)
         comm_tracker.log_round(server_round, round_download, round_upload)
+
+        # NEW: upcast each client's returned fp16 parameters back to fp32
+        # BEFORE FedAvg's weighted averaging runs. This keeps aggregation
+        # numerically accurate — averaging directly in fp16 across rounds
+        # would compound rounding error. Only the WIRE format was fp16;
+        # the actual aggregation math stays fp32.
+        for _, fit_res in results:
+            ndarrays = parameters_to_ndarrays(fit_res.parameters)
+            ndarrays_fp32 = dequantize_to_fp32(ndarrays)
+            fit_res.parameters = ndarrays_to_parameters(ndarrays_fp32)
 
         aggregated = super().aggregate_fit(server_round, results, failures)
 
@@ -252,15 +297,14 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
+            torch.save(self.global_model.state_dict(), "best_model_fp16.pth")
 
         # Final evaluation after last round
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
-            # print and save communication summary at the very end
             comm_tracker.summary()
-            comm_tracker.save_csv("communication_log.csv")
+            comm_tracker.save_csv("communication_log_fp16.csv")
 
         return aggregated
 
@@ -286,31 +330,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         accuracy = accuracy_score(all_labels, all_preds)
 
-        # During training rounds, return only accuracy
         if not final:
             return accuracy
 
-        # Only after final round
-        precision = precision_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
-
-        recall = recall_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
-
-        f1 = f1_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
+        precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+        recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
 
         print(f"Accuracy : {accuracy:.4f}")
         print(f"Precision: {precision:.4f}")
@@ -327,10 +352,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix")
+        plt.title("Final Confusion Matrix (fp16 quantized comm)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix.png")
+        plt.savefig("final_confusion_matrix_fp16.png")
         plt.close()
 
         return accuracy
@@ -342,7 +367,6 @@ def main(train_csv: str, test_csv: str):
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    # NEW: print model size / theoretical per-round cost before training starts
     _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
     print_model_size_summary(_tmp_model)
     del _tmp_model
@@ -361,7 +385,7 @@ def main(train_csv: str, test_csv: str):
 
     strategy = SaveModelStrategy(test_loader=test_loader)
 
-    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
+    print(f"Starting FL (fp16 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
     fl.simulation.start_simulation(
         client_fn=client_fn,
