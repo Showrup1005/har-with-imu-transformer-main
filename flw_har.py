@@ -29,6 +29,80 @@ NUM_ROUNDS = 40
 
 print(f"Using device: {DEVICE}")
 
+# ============================================================
+#  communication cost measurement utilities
+# ============================================================
+def compute_ndarrays_size(ndarrays):
+    """Total size in bytes of a list of numpy arrays, as they'll actually
+    be sent over the wire (each array's own dtype, not assumed fp32)."""
+    return sum(arr.nbytes for arr in ndarrays)
+
+
+def print_model_size_summary(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    size_mb = size_bytes / (1024 ** 2)
+
+    print("\n" + "=" * 60)
+    print("MODEL SIZE SUMMARY")
+    print("=" * 60)
+    print(f"Total parameters:     {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Model size (fp32):    {size_bytes:,} bytes = {size_mb:.2f} MB")
+    print("=" * 60 + "\n")
+    return size_bytes
+
+
+class CommunicationTracker:
+    """Accumulates real transmitted bytes across the whole FL run:
+    download = server -> client (parameters sent into fit/evaluate)
+    upload   = client -> server (parameters returned from fit)
+    """
+    def __init__(self):
+        self.round_log = []  # list of dicts per round
+        self.total_download_bytes = 0
+        self.total_upload_bytes = 0
+
+    def log_round(self, server_round, download_bytes, upload_bytes):
+        self.total_download_bytes += download_bytes
+        self.total_upload_bytes += upload_bytes
+        total_round_bytes = download_bytes + upload_bytes
+        self.round_log.append({
+            "round": server_round,
+            "download_bytes": download_bytes,
+            "upload_bytes": upload_bytes,
+            "total_bytes": total_round_bytes,
+        })
+        print(f"  [Comm] Round {server_round}: "
+              f"download={download_bytes/1024**2:.2f} MB, "
+              f"upload={upload_bytes/1024**2:.2f} MB, "
+              f"round_total={total_round_bytes/1024**2:.2f} MB")
+
+    def summary(self):
+        total = self.total_download_bytes + self.total_upload_bytes
+        print("\n" + "=" * 60)
+        print("COMMUNICATION COST SUMMARY")
+        print("=" * 60)
+        print(f"Total download (server->client): {self.total_download_bytes/1024**2:.2f} MB")
+        print(f"Total upload   (client->server): {self.total_upload_bytes/1024**2:.2f} MB")
+        print(f"Total communication:             {total/1024**2:.2f} MB ({total/1024**3:.4f} GB)")
+        if self.round_log:
+            avg_round = total / len(self.round_log)
+            print(f"Average per round:                {avg_round/1024**2:.2f} MB")
+        print("=" * 60 + "\n")
+
+    def save_csv(self, path="communication_log.csv"):
+        import csv
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["round", "download_bytes", "upload_bytes", "total_bytes"])
+            writer.writeheader()
+            writer.writerows(self.round_log)
+        print(f"Communication log saved to {path}")
+
+
+comm_tracker = CommunicationTracker()
+
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
     train_dataset = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"])
@@ -88,6 +162,9 @@ class IMUClient(fl.client.NumPyClient):
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
+        # measure download size (server -> this client) before training
+        download_bytes = compute_ndarrays_size(parameters)
+
         self.set_parameters(parameters)
         self.model.train()
         total_loss = 0.0
@@ -105,7 +182,15 @@ class IMUClient(fl.client.NumPyClient):
                 self.optimizer.step()
                 total_loss += loss.item()
 
-        return self.get_parameters(), len(self.train_loader.dataset), {"train_loss": total_loss / len(self.train_loader)}
+        updated_params = self.get_parameters()
+        # measure upload size (this client -> server)
+        upload_bytes = compute_ndarrays_size(updated_params)
+
+        return updated_params, len(self.train_loader.dataset), {
+            "train_loss": total_loss / len(self.train_loader),
+            "download_bytes": download_bytes,
+            "upload_bytes": upload_bytes,
+        }
     
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -137,6 +222,16 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
+
+        # sum up actual download/upload bytes reported by each client this round
+        round_download = 0
+        round_upload = 0
+        for _, fit_res in results:
+            metrics = fit_res.metrics
+            round_download += metrics.get("download_bytes", 0)
+            round_upload += metrics.get("upload_bytes", 0)
+        comm_tracker.log_round(server_round, round_download, round_upload)
+
         aggregated = super().aggregate_fit(server_round, results, failures)
 
         if aggregated is None:
@@ -163,6 +258,9 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
+            # print and save communication summary at the very end
+            comm_tracker.summary()
+            comm_tracker.save_csv("communication_log.csv")
 
         return aggregated
 
@@ -243,6 +341,11 @@ def main(train_csv: str, test_csv: str):
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
+
+    # NEW: print model size / theoretical per-round cost before training starts
+    _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
+    print_model_size_summary(_tmp_model)
+    del _tmp_model
 
     def client_fn(context):
         if hasattr(context, "node_id"):
