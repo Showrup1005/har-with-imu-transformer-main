@@ -109,7 +109,7 @@ class CommunicationTracker:
 comm_tracker = CommunicationTracker()
 
 # ============================================================
-# NEW: int8 quantization helpers (per-tensor symmetric scale)
+#  int8 quantization helpers (per-tensor symmetric scale)
 # ============================================================
 def quantize_to_int8(ndarrays):
     """
@@ -130,17 +130,20 @@ def quantize_to_int8(ndarrays):
     """
     quantized = []
     scales = []
-    for arr in ndarrays:
+    for i, arr in enumerate(ndarrays):
         arr = arr.astype(np.float32)
+        if not np.all(np.isfinite(arr)):
+            print(f"WARNING: non-finite values in param tensor {i}, shape {arr.shape}")
         max_abs = np.max(np.abs(arr))
         scale = (max_abs / 127.0) if max_abs > 0 else 1.0
         q = np.round(arr / scale)
+        q = np.nan_to_num(q, nan=0.0, posinf=127.0, neginf=-127.0)  # NEW: catch any NaN/inf before cast
         q = np.clip(q, -127, 127).astype(np.int8)
         quantized.append(q)
         scales.append(scale)
 
     scales_arr = np.array(scales, dtype=np.float32)
-    quantized.append(scales_arr)  # carried as the last element of the list
+    quantized.append(scales_arr)
     return quantized
 
 
@@ -154,9 +157,6 @@ def dequantize_from_int8(ndarrays):
     for arr, scale in zip(quantized, scales_arr):
         dequantized.append(arr.astype(np.float32) * scale)
     return dequantized
-# ============================================================
-# END NEW BLOCK
-# ============================================================
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -206,7 +206,7 @@ class IMUClient(fl.client.NumPyClient):
         self.criterion = torch.nn.CrossEntropyLoss()
 
     def get_parameters(self, config=None):
-        # NEW: quantize to int8 before this leaves the client (upload compression)
+        #  quantize to int8 before this leaves the client (upload compression)
         fp32_params = [val.cpu().numpy() for _, val in self.model.state_dict().items()]
         return quantize_to_int8(fp32_params)
 
@@ -215,7 +215,7 @@ class IMUClient(fl.client.NumPyClient):
             params = parameters_to_ndarrays(parameters)
         else:
             params = parameters
-        # NEW: whatever arrived on the wire (int8 + scales from server),
+        #  whatever arrived on the wire (int8 + scales from server),
         # dequantize back to fp32 before loading into the model —
         # training must stay in fp32 for stable gradients.
         params = dequantize_from_int8(params)
@@ -281,13 +281,20 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.best_acc = 0.0
 
     def configure_fit(self, server_round, parameters, client_manager):
-        # NEW: quantize the outgoing global model to int8 before it's
-        # distributed to clients (download compression).
         ndarrays = parameters_to_ndarrays(parameters)
         quantized_ndarrays = quantize_to_int8(ndarrays)
         quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
         return super().configure_fit(server_round, quantized_parameters, client_manager)
 
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        # unquantized fp32 params while set_parameters() still expects
+        # the int8+scales format, causing a silent off-by-one that drops
+        # the last parameter tensor and breaks load_state_dict(strict=True).
+        ndarrays = parameters_to_ndarrays(parameters)
+        quantized_ndarrays = quantize_to_int8(ndarrays)
+        quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
+        return super().configure_evaluate(server_round, quantized_parameters, client_manager)
+    
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
 
