@@ -223,7 +223,6 @@ class IMUClient(fl.client.NumPyClient):
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
-        # measure download size (server -> this client) exactly as received on the wire
         download_bytes = compute_ndarrays_size(parameters)
 
         self.set_parameters(parameters)
@@ -232,18 +231,20 @@ class IMUClient(fl.client.NumPyClient):
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
-                
-                imu = batch["imu"].to(DEVICE).float()   
+                imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
 
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
                 loss = self.criterion(output, label)
                 loss.backward()
+                # Prevents exploding gradients from producing NaN weights.
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
                 self.optimizer.step()
                 total_loss += loss.item()
 
-        updated_params = self.get_parameters()  # already int8-quantized
+        updated_params = self.get_parameters()
         upload_bytes = compute_ndarrays_size(updated_params)
 
         return updated_params, len(self.train_loader.dataset), {
