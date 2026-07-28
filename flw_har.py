@@ -412,6 +412,13 @@ def main(train_csv: str, test_csv: str):
 
     _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
     print_model_size_summary(_tmp_model)
+
+    # build genuine fp32 initial parameters here, so Flower never
+    # falls back to asking a client for get_parameters() (which always
+    # returns int8+scales) to seed round 1. This was the actual bug —
+    # double-quantizing the bootstrap parameters, not gradient explosion.
+    initial_ndarrays = [val.cpu().numpy() for _, val in _tmp_model.state_dict().items()]
+    initial_parameters = ndarrays_to_parameters(initial_ndarrays)
     del _tmp_model
 
     def client_fn(context):
@@ -421,12 +428,13 @@ def main(train_csv: str, test_csv: str):
             cid = int(context.node_config["cid"])
         else:
             cid = 0
-        
-        client_idx = cid % len(client_datasets)   
-        
+        client_idx = cid % len(client_datasets)
         return IMUClient(client_datasets[client_idx]).to_client()
 
-    strategy = SaveModelStrategy(test_loader=test_loader)
+    strategy = SaveModelStrategy(
+        test_loader=test_loader,
+        initial_parameters=initial_parameters,   # passed through **kwargs to FedAvg
+    )
 
     print(f"Starting FL (int8 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
@@ -437,6 +445,5 @@ def main(train_csv: str, test_csv: str):
         strategy=strategy,
         client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
     )
-
 if __name__ == "__main__":
     main("train.csv", "test.csv")
