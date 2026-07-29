@@ -5,9 +5,6 @@ Drop-in replacement for the original fl_train.py. Model, dataset, and
 overall FL loop are unchanged; the client no longer sends raw updated
 weights -- it sends a Fisher-sparsified, quantized, seed-permuted delta.
 The server strategy reverses this before aggregating.
-
-New knobs (edit the constants below or wire them into config.json if
-you prefer):
     USE_PRIVACY          -- master on/off switch (False = behaves like
                              the original plain FedAvg script)
     PRIVACY_KEEP_RATIO    -- fraction of each tensor's elements sent
@@ -330,7 +327,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         new_state = {}
         for k in keys:
             avg_delta = weighted_deltas[k] / max(1, total_examples)
-            new_state[k] = global_state[k] + torch.tensor(avg_delta, dtype=global_state[k].dtype)
+            new_state[k] = global_state[k] + torch.tensor(avg_delta, dtype=global_state[k].dtype, device=global_state[k].device)
 
         self.global_model.load_state_dict(new_state)
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
