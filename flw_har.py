@@ -6,6 +6,8 @@ overall FL loop are unchanged; the client no longer sends raw updated
 weights -- it sends a Fisher-sparsified, quantized, seed-permuted delta.
 The server strategy reverses this before aggregating.
 
+New knobs (edit the constants below or wire them into config.json if
+you prefer):
     USE_PRIVACY          -- master on/off switch (False = behaves like
                              the original plain FedAvg script)
     PRIVACY_KEEP_RATIO    -- fraction of each tensor's elements sent
@@ -30,7 +32,63 @@ warnings.filterwarnings("ignore")
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
-import privacy_utils as pu
+
+
+# ====================== PRIVACY (SAPM) HELPERS ======================
+class pu:
+    @staticmethod
+    def compute_topk_mask(fisher_flat: np.ndarray, keep_ratio: float) -> np.ndarray:
+        n = fisher_flat.size
+        k = max(1, int(np.ceil(keep_ratio * n)))
+        if k >= n:
+            return np.ones(n, dtype=bool)
+        idx = np.argpartition(fisher_flat, -k)[-k:]
+        mask = np.zeros(n, dtype=bool)
+        mask[idx] = True
+        return mask
+
+    @staticmethod
+    def compute_quant_params(x: np.ndarray):
+        x_min, x_max = float(x.min()), float(x.max())
+        if x_max == x_min:
+            return 1.0, x_min
+        return x_max - x_min, x_min
+
+    @staticmethod
+    def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int = 8) -> np.ndarray:
+        if num_bits >= 32:
+            return x.astype(np.float32)
+        qmax = 2 ** num_bits - 1
+        step = scale / qmax if scale != 0 else 1.0
+        x_scaled = (x - zmin) / step
+        floor = np.floor(x_scaled)
+        prob = np.clip(x_scaled - floor, 0.0, 1.0)
+        rnd = np.random.rand(*x.shape)
+        x_q = floor + (rnd < prob)
+        x_q = np.clip(x_q, 0, qmax)
+        return x_q.astype(np.float32)
+
+    @staticmethod
+    def dequantize_with_params(x_q: np.ndarray, scale: float, zmin: float, num_bits: int = 8) -> np.ndarray:
+        if num_bits >= 32:
+            return x_q
+        qmax = 2 ** num_bits - 1
+        step = scale / qmax if scale != 0 else 1.0
+        return x_q * step + zmin
+
+    @staticmethod
+    def permute_array(x: np.ndarray, seed: int):
+        rng = np.random.RandomState(seed % (2 ** 31 - 1))
+        perm = rng.permutation(x.size)
+        return x[perm]
+
+    @staticmethod
+    def unpermute_array(x: np.ndarray, seed: int, size: int):
+        rng = np.random.RandomState(seed % (2 ** 31 - 1))
+        perm = rng.permutation(size)
+        inv = np.empty_like(perm)
+        inv[perm] = np.arange(size)
+        return x[inv]
 
 # ====================== CONFIG ======================
 with open('config.json', 'r') as f:
