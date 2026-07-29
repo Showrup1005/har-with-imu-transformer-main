@@ -19,6 +19,7 @@ import torch
 import numpy as np
 import json
 import warnings
+import zlib
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import seaborn as sns
@@ -29,6 +30,10 @@ warnings.filterwarnings("ignore")
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
+
+
+def deterministic_hash(name: str) -> int:
+    return zlib.crc32(name.encode("utf-8"))
 
 
 # ====================== PRIVACY (SAPM) HELPERS ======================
@@ -233,7 +238,7 @@ class IMUClient(fl.client.NumPyClient):
 
             scale, zmin = pu.compute_quant_params(delta_flat)
             q = pu.quantize_with_params(sparse_delta, scale, zmin, quant_bits)
-            permuted = pu.permute_array(q, seed=round_seed * 100003 + hash(name) % 97)
+            permuted = pu.permute_array(q, seed=round_seed * 100003 + deterministic_hash(name) % 97)
 
             out_arrays.append(permuted.reshape(delta.shape).astype(np.float32))
             meta.append([float(scale), float(zmin), True])
@@ -314,7 +319,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
                 flat = arr.reshape(-1)
 
                 if quantized:
-                    seed = server_round * 100003 + hash(k) % 97
+                    seed = server_round * 100003 + deterministic_hash(k) % 97
                     unpermuted = pu.unpermute_array(flat, seed=seed, size=flat.size)
                     reconstructed = pu.dequantize_with_params(unpermuted, scale, zmin, self.privacy_quant_bits)
                 else:
