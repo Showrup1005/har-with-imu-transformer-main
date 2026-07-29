@@ -5,6 +5,7 @@ Drop-in replacement for the original fl_train.py. Model, dataset, and
 overall FL loop are unchanged; the client no longer sends raw updated
 weights -- it sends a Fisher-sparsified, quantized, seed-permuted delta.
 The server strategy reverses this before aggregating.
+
     USE_PRIVACY          -- master on/off switch (False = behaves like
                              the original plain FedAvg script)
     PRIVACY_KEEP_RATIO    -- fraction of each tensor's elements sent
