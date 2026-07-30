@@ -62,7 +62,20 @@ NUM_ROUNDS = 40
 # ---- DP strategy knobs ----
 USE_DP = True
 MAX_GRAD_NORM = 1.0     # C: L2 clipping norm applied to each client's full flattened update
-NOISE_MULTIPLIER = 0.5  # sigma: noise std = NOISE_MULTIPLIER * MAX_GRAD_NORM
+
+# sigma (per-coordinate noise multiplier) needs to be calibrated to model
+# size: the *total* L2 norm of the noise vector scales as sqrt(num_params)
+# * sigma * C, since noise is added independently to every parameter. For
+# a model with ~1.5M parameters, sigma=0.5 gives a noise vector with norm
+# ~600 -- ~600x larger than the clipped signal (norm <= C=1.0) -- which
+# swamps the update completely and can push weights to NaN. NOISE_MULTIPLIER
+# is therefore computed below relative to actual parameter count so the
+# noise vector's norm stays roughly comparable to MAX_GRAD_NORM.
+_NUM_MODEL_PARAMS = sum(p.numel() for p in IMUTransformerEncoder(config).parameters())
+NOISE_MULTIPLIER = 1.0 / (_NUM_MODEL_PARAMS ** 0.5)   # ~= noise vector norm of MAX_GRAD_NORM
+print(f"Model has {_NUM_MODEL_PARAMS:,} parameters -> auto-calibrated NOISE_MULTIPLIER = {NOISE_MULTIPLIER:.6f}")
+print("(Override NOISE_MULTIPLIER below this line for a different privacy/utility point; "
+      "remember noise vector norm ~= sqrt(num_params) * NOISE_MULTIPLIER * MAX_GRAD_NORM)")
 
 print(f"Using device: {DEVICE}")
 print(f"Privacy strategy: DP-FedAvg | enabled={USE_DP} | clip_norm={MAX_GRAD_NORM} | noise_multiplier={NOISE_MULTIPLIER}")
@@ -122,7 +135,19 @@ class IMUClient(fl.client.NumPyClient):
             params = parameters_to_ndarrays(parameters)
         else:
             params = parameters
-        state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
+        # Guard against a NaN/Inf global model (e.g. from an earlier round's
+        # noise pushing weights to extreme values) so it can't silently
+        # propagate forever -- replace any non-finite values with 0 and warn.
+        cleaned = []
+        found_bad = False
+        for v in params:
+            if not np.all(np.isfinite(v)):
+                found_bad = True
+                v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            cleaned.append(v)
+        if found_bad:
+            print("WARNING: received non-finite global parameters, sanitized to 0 for this client's local copy.")
+        state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), cleaned)}
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, fit_config):
@@ -235,9 +260,17 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             total_examples += num_examples
 
         new_state = {}
+        any_nonfinite = False
         for k in keys:
             avg_delta = weighted_deltas[k] / max(1, total_examples)
+            if not np.all(np.isfinite(avg_delta)):
+                any_nonfinite = True
+                avg_delta = np.zeros_like(avg_delta)
             new_state[k] = global_state[k] + torch.tensor(avg_delta, dtype=global_state[k].dtype, device=global_state[k].device)
+
+        if any_nonfinite:
+            print(f"WARNING: round {server_round} produced non-finite aggregated delta for one or more "
+                  f"tensors -- those tensors were left unchanged this round instead of applying garbage.")
 
         self.global_model.load_state_dict(new_state)
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
