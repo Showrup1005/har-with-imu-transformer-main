@@ -42,6 +42,7 @@ CAVEATS (read before treating results as a formal privacy proof):
 
 import json
 import warnings
+import contextlib
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -50,6 +51,33 @@ warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
+
+
+@contextlib.contextmanager
+def math_attention_only():
+    """DLG-style attacks need to backprop through the gradient computation
+    itself (a 'double backward'). PyTorch's fused/flash/memory-efficient
+    scaled-dot-product-attention kernels (used internally by
+    nn.TransformerEncoderLayer / nn.MultiheadAttention) don't implement
+    that second-order derivative and raise a RuntimeError. The plain
+    'math' SDPA backend does support it -- this context manager forces
+    that backend for the duration of the attack."""
+    try:
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        with sdpa_kernel(SDPBackend.MATH):
+            yield
+        return
+    except ImportError:
+        pass
+    try:
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            yield
+        return
+    except AttributeError:
+        pass
+    # Fallback: no kernel-selection API available on this torch version --
+    # proceed without forcing (may still fail on some torch versions/models).
+    yield
 
 # ====================== CONFIG ======================
 with open('config.json', 'r') as f:
@@ -174,11 +202,12 @@ def gradient_matching_attack(model, target_grads, true_label, input_shape, iters
 
     for _ in range(iters):
         optimizer.zero_grad()
-        output = model({"imu": dummy_input})
-        loss = criterion(output, label_t)
-        grads = torch.autograd.grad(loss, list(model.parameters()), create_graph=True)
-        match_loss = sum(((g - t) ** 2).sum() for g, t in zip(grads, target_list))
-        match_loss.backward()
+        with math_attention_only():
+            output = model({"imu": dummy_input})
+            loss = criterion(output, label_t)
+            grads = torch.autograd.grad(loss, list(model.parameters()), create_graph=True)
+            match_loss = sum(((g - t) ** 2).sum() for g, t in zip(grads, target_list))
+            match_loss.backward()
         optimizer.step()
 
     return dummy_input.detach()
