@@ -72,7 +72,7 @@ DP_NOISE_MULTIPLIER = None  # None = auto-calibrate from param count, as in fl_t
 # --- Attack optimization ---
 ATTACK_ITERS = 400
 ATTACK_LR = 0.05
-NUM_VICTIMS = 5  
+NUM_VICTIMS = 5   
 
 
 # ====================== SAPM TRANSFORM (same math as fl_train_sapm.py) ======================
@@ -254,8 +254,10 @@ def main(train_csv: str):
 
     for i, idx in enumerate(indices):
         sample = train_dataset[idx]
-        sample_imu = sample["imu"].unsqueeze(0).to(DEVICE).float()
-        label_val = sample["label"].item() if torch.is_tensor(sample["label"]) else sample["label"]
+        imu_raw = sample["imu"]
+        imu_t = imu_raw if torch.is_tensor(imu_raw) else torch.tensor(imu_raw)
+        sample_imu = imu_t.unsqueeze(0).to(DEVICE).float()
+        label_val = sample["label"].item() if torch.is_tensor(sample["label"]) else int(sample["label"])
         sample_label = torch.tensor([label_val], device=DEVICE, dtype=torch.long)
 
         print(f"--- Victim {i+1}/{NUM_VICTIMS} (true label {label_val}) ---")
