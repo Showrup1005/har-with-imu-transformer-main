@@ -1,383 +1,301 @@
 """
-Federated HAR training with standard Differential Privacy (DP-FedAvg).
+Gradient-inversion attack harness: empirically measures how hard it is to
+reconstruct a client's raw IMU input window from what the server actually
+receives, under three conditions:
 
-This is the McMahan et al. (2017) "Learning Differentially Private
-Recurrent Language Models" client-level DP mechanism, adapted here to
-per-round updates:
+    1. NO PRIVACY   -- raw single local-training-step gradient
+    2. SAPM         -- Fisher-sparsified + quantized + permuted, then
+                       unpermuted/dequantized exactly as your aggregate_fit
+                       does (i.e. what the server actually reconstructs)
+    3. DP-FEDAVG    -- L2-clipped + Gaussian-noised gradient
 
-    1. Each client computes its local update (delta = new_weights - old_weights)
-       after local training, exactly as in the non-private baseline.
-    2. The ENTIRE update (flattened across all layers into one vector) is
-       L2-clipped to a maximum norm C: if ||delta|| > C, scale it down to
-       have norm exactly C. This bounds the maximum influence any single
-       client's update can have on the aggregate.
-    3. Independent Gaussian noise N(0, (sigma * C)^2) is added to every
-       coordinate of the clipped update, where sigma is the noise
-       multiplier. This is the standard Gaussian mechanism for
-       differential privacy.
-    4. The full, dense, noised update is sent to the server -- nothing is
-       sparsified, quantized, or permuted. Every coordinate is
-       transmitted, just perturbed.
+This uses the DLG (Deep Leakage from Gradients) / iDLG attack: the
+attacker starts from random noise as a guess for the victim's input,
+then repeatedly adjusts that guess so that its own gradient (computed by
+forward/backward-passing the guess through the SAME model weights the
+victim used) matches the gradient the attacker actually observed. If the
+match is close, the guess converges toward the true input.
 
-This gives a formal, quantifiable per-round privacy guarantee governed by
-(C, sigma): larger sigma / smaller C => stronger privacy, more noise,
-worse accuracy. Rigorously composing the guarantee across all NUM_ROUNDS
-rounds into a single (epsilon, delta) requires an accountant (e.g. the
-Opacus or Google dp-accounting RDP accountant) -- this script reports the
-mechanism's raw parameters (clip norm, noise multiplier, effective noise
-std) each round rather than a composed epsilon, since the exact number
-depends on the accounting method and client sampling probability you
-choose to report. 
+THREAT MODEL: the attacker is the aggregating server (has the model
+weights and, for SAPM, the round seed -- the realistic strong-adversary
+case established in our earlier discussion, since the permutation gives
+no protection against the server itself).
+
+CAVEATS (read before treating results as a formal privacy proof):
+- This is an empirical demonstration, not a formal privacy guarantee.
+  A low reconstruction error is strong evidence of weak privacy; a high
+  reconstruction error is evidence the mechanism raises the practical
+  cost of attack, not proof that reconstruction is impossible under any
+  attacker/optimizer/prior.
+- Uses a SINGLE local-training-step gradient (one forward/backward pass,
+  no optimizer.step() applied yet) rather than a multi-epoch delta --
+  this is deliberately the strongest, most literature-standard attack
+  scenario (multi-step deltas are already harder to invert, which is
+  itself worth a sentence in your thesis).
+- Results depend on attack hyperparameters (iterations, learning rate,
+  init). Run with a few different random victims/seeds and report the
+  average/spread, not a single number, for a defensible thesis claim.
+- Uses random model weights (SAPM/DP tend to be *more* vulnerable to
+  this kind of attack early in training and *less* vulnerable on a
+  well-trained model).
 """
 
-import flwr as fl
-import torch
-import numpy as np
 import json
 import warnings
-from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-import seaborn as sns
+import numpy as np
+import torch
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
-from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 # ====================== CONFIG ======================
 with open('config.json', 'r') as f:
     config = json.load(f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.manual_seed(42)
-np.random.seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
-NUM_CLIENTS = 3
-LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+torch.manual_seed(0)
+np.random.seed(0)
 
-# ---- DP strategy knobs ----
-USE_DP = True
-MAX_GRAD_NORM = 1.0     # C: L2 clipping norm applied to each client's full flattened update
+MODEL_CHECKPOINT = None   
 
-# sigma (per-coordinate noise multiplier) needs to be calibrated to model
-# size: the *total* L2 norm of the noise vector scales as sqrt(num_params)
-# * sigma * C, since noise is added independently to every parameter. For
-# a model with ~1.5M parameters, sigma=0.5 gives a noise vector with norm
-# ~600 -- ~600x larger than the clipped signal (norm <= C=1.0) -- which
-# swamps the update completely and can push weights to NaN. NOISE_MULTIPLIER
-# is therefore computed below relative to actual parameter count so the
-# noise vector's norm stays roughly comparable to MAX_GRAD_NORM.
-_NUM_MODEL_PARAMS = sum(p.numel() for p in IMUTransformerEncoder(config).parameters())
-NOISE_MULTIPLIER = 1.0 / (_NUM_MODEL_PARAMS ** 0.5)   # ~= noise vector norm of MAX_GRAD_NORM
-print(f"Model has {_NUM_MODEL_PARAMS:,} parameters -> auto-calibrated NOISE_MULTIPLIER = {NOISE_MULTIPLIER:.6f}")
-print("(Override NOISE_MULTIPLIER below this line for a different privacy/utility point; "
-      "remember noise vector norm ~= sqrt(num_params) * NOISE_MULTIPLIER * MAX_GRAD_NORM)")
+# --- SAPM parameters  ---
+SAPM_KEEP_RATIO = 0.6
+SAPM_QUANT_BITS = 8
 
-print(f"Using device: {DEVICE}")
-print(f"Privacy strategy: DP-FedAvg | enabled={USE_DP} | clip_norm={MAX_GRAD_NORM} | noise_multiplier={NOISE_MULTIPLIER}")
+# --- DP parameters  ---
+DP_MAX_GRAD_NORM = 1.0
+DP_NOISE_MULTIPLIER = None  # None = auto-calibrate from param count, as in fl_train_dp.py
 
-# ====================== DATA ======================
-def load_data(train_csv: str, test_csv: str):
-    train_dataset = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"])
-    test_dataset = IMUDataset(test_csv, config["window_size"], config["input_dim"], config["window_shift"])
-    print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
-    return train_dataset, test_dataset
+# --- Attack optimization ---
+ATTACK_ITERS = 400
+ATTACK_LR = 0.05
+NUM_VICTIMS = 5  
 
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS, save_file="client_split.json", seed=42):
-    n = len(train_dataset)
-    indices = np.arange(n)
 
-    np.random.seed(seed)
-    np.random.shuffle(indices)
+# ====================== SAPM TRANSFORM (same math as fl_train_sapm.py) ======================
+def compute_topk_mask(fisher_flat, keep_ratio):
+    n = fisher_flat.size
+    k = max(1, int(np.ceil(keep_ratio * n)))
+    if k >= n:
+        return np.ones(n, dtype=bool)
+    idx = np.argpartition(fisher_flat, -k)[-k:]
+    mask = np.zeros(n, dtype=bool)
+    mask[idx] = True
+    return mask
 
-    client_datasets = []
-    size = n // num_clients
+def compute_quant_params(x):
+    x_min, x_max = float(x.min()), float(x.max())
+    if x_max == x_min:
+        return 1.0, x_min
+    return x_max - x_min, x_min
 
-    print(f"\n=== Client Data Distribution (Seed={seed}) ===")
+def quantize_with_params(x, scale, zmin, num_bits=8):
+    if num_bits >= 32:
+        return x.astype(np.float32)
+    qmax = 2 ** num_bits - 1
+    step = scale / qmax if scale != 0 else 1.0
+    x_scaled = (x - zmin) / step
+    floor = np.floor(x_scaled)
+    prob = np.clip(x_scaled - floor, 0.0, 1.0)
+    rnd = np.random.rand(*x.shape)
+    x_q = floor + (rnd < prob)
+    return np.clip(x_q, 0, qmax).astype(np.float32)
 
-    for i in range(num_clients):
-        start = i * size
-        end = start + size if i < num_clients - 1 else n
-        subset = Subset(train_dataset, indices[start:end])
-        client_datasets.append(subset)
+def dequantize_with_params(x_q, scale, zmin, num_bits=8):
+    if num_bits >= 32:
+        return x_q
+    qmax = 2 ** num_bits - 1
+    step = scale / qmax if scale != 0 else 1.0
+    return x_q * step + zmin
 
-        labels = []
-        for idx in indices[start:end]:
-            sample = train_dataset[idx]
-            label = sample['label'].item() if torch.is_tensor(sample['label']) else sample['label']
-            labels.append(label)
+def apply_sapm_transform(true_grads, keep_ratio, quant_bits):
+    """Simulates the FULL round trip: client-side mask+quantize+permute,
+    then server-side unpermute+dequantize -- returns what the server
+    actually reconstructs and uses (a client-supplied seed isn't even
+    needed here since permutation is a no-op against the server: shuffle
+    then un-shuffle with the correct seed always returns the original
+    order, so we skip simulating it explicitly)."""
+    out = {}
+    for name, g in true_grads.items():
+        g_np = g.cpu().numpy().astype(np.float32)
+        flat = g_np.reshape(-1)
+        fisher_flat = flat ** 2  # single-step Fisher proxy = grad^2
+        mask = compute_topk_mask(fisher_flat, keep_ratio)
+        sparse = np.where(mask, flat, 0.0).astype(np.float32)
+        scale, zmin = compute_quant_params(flat)
+        q = quantize_with_params(sparse, scale, zmin, quant_bits)
+        recon = dequantize_with_params(q, scale, zmin, quant_bits)
+        out[name] = torch.tensor(recon.reshape(g_np.shape), dtype=g.dtype, device=g.device)
+    return out
 
-        unique, counts = np.unique(labels, return_counts=True)
-        dist = dict(zip(unique.tolist(), counts.tolist()))
 
-        print(f"Client {i} → {len(subset)} samples | Label distribution: {dist}")
+# ====================== DP TRANSFORM (same math as fl_train_dp.py) ======================
+def apply_dp_transform(true_grads, max_norm, noise_multiplier):
+    names = list(true_grads.keys())
+    arrays = [true_grads[n].cpu().numpy().astype(np.float32) for n in names]
+    pre_norm = float(np.sqrt(sum(np.sum(a.astype(np.float64) ** 2) for a in arrays)))
+    clip_factor = min(1.0, max_norm / (pre_norm + 1e-12))
+    arrays = [a * clip_factor for a in arrays]
+    noise_std = noise_multiplier * max_norm
+    arrays = [a + np.random.normal(0.0, noise_std, size=a.shape).astype(np.float32) for a in arrays]
+    return {n: torch.tensor(a, dtype=true_grads[n].dtype, device=true_grads[n].device) for n, a in zip(names, arrays)}
 
-    print("=" * 60)
-    return client_datasets
 
-# ====================== CLIENT ======================
-class IMUClient(fl.client.NumPyClient):
-    def __init__(self, train_subset):
-        self.model = IMUTransformerEncoder(config).to(DEVICE)
-        self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 1e-4))
-        self.criterion = torch.nn.CrossEntropyLoss()
+# ====================== ATTACK ======================
+def infer_label_from_bias(target_grads, bias_key, num_classes):
+    """iDLG trick: for cross-entropy loss on a single sample, the true
+    class's logit-bias gradient is negative and all others are positive
+    (since dL/dz_y = softmax(z)_y - 1 < 0 for the true class, softmax(z)_c
+    > 0 otherwise). Returns (predicted_label, leaked) where leaked=False
+    means the bias gradient was entirely zeroed out (e.g. by SAPM's
+    sparsification) and no label could be inferred from it."""
+    if bias_key not in target_grads:
+        return None, False
+    bias_grad = target_grads[bias_key].detach().cpu().numpy()
+    if np.allclose(bias_grad, 0.0):
+        return None, False
+    return int(np.argmin(bias_grad)), True
 
-    def get_parameters(self, config=None):
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+def gradient_matching_attack(model, target_grads, true_label, input_shape, iters, lr):
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(True)
 
-    def set_parameters(self, parameters):
-        if hasattr(parameters, "tensors"):
-            params = parameters_to_ndarrays(parameters)
-        else:
-            params = parameters
-        # Guard against a NaN/Inf global model (e.g. from an earlier round's
-        # noise pushing weights to extreme values) so it can't silently
-        # propagate forever -- replace any non-finite values with 0 and warn.
-        cleaned = []
-        found_bad = False
-        for v in params:
-            if not np.all(np.isfinite(v)):
-                found_bad = True
-                v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-            cleaned.append(v)
-        if found_bad:
-            print("WARNING: received non-finite global parameters, sanitized to 0 for this client's local copy.")
-        state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), cleaned)}
-        self.model.load_state_dict(state_dict, strict=True)
+    dummy_input = torch.randn(input_shape, device=DEVICE, requires_grad=True)
+    label_t = torch.tensor([true_label], device=DEVICE, dtype=torch.long)
+    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam([dummy_input], lr=lr)
 
-    def fit(self, parameters, fit_config):
-        self.set_parameters(parameters)
-        old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+    param_names = [n for n, _ in model.named_parameters()]
+    target_list = [target_grads[n] for n in param_names]
 
-        use_dp = fit_config.get("use_dp", USE_DP)
-        max_norm = fit_config.get("max_grad_norm", MAX_GRAD_NORM)
-        noise_mult = fit_config.get("noise_multiplier", NOISE_MULTIPLIER)
+    for _ in range(iters):
+        optimizer.zero_grad()
+        output = model({"imu": dummy_input})
+        loss = criterion(output, label_t)
+        grads = torch.autograd.grad(loss, list(model.parameters()), create_graph=True)
+        match_loss = sum(((g - t) ** 2).sum() for g, t in zip(grads, target_list))
+        match_loss.backward()
+        optimizer.step()
 
-        self.model.train()
-        total_loss = 0.0
+    return dummy_input.detach()
 
-        for _ in range(LOCAL_EPOCHS):
-            for batch in self.train_loader:
-                imu = batch["imu"].to(DEVICE).float()
-                label = batch["label"].to(DEVICE).long()
 
-                self.optimizer.zero_grad()
-                output = self.model({"imu": imu})
-                loss = self.criterion(output, label)
-                loss.backward()
-                self.optimizer.step()
-                total_loss += loss.item()
+def run_victim(model, sample_imu, sample_label):
+    model.zero_grad()
+    output = model({"imu": sample_imu})
+    loss = torch.nn.functional.cross_entropy(output, sample_label)
+    grads = torch.autograd.grad(loss, list(model.parameters()))
+    true_grads = {n: g.detach().clone() for (n, _), g in zip(model.named_parameters(), grads)}
 
-        new_state = self.model.state_dict()
-        keys = list(new_state.keys())
-        deltas = [(new_state[k] - old_state[k]).cpu().numpy().astype(np.float32) for k in keys]
+    bias_key = "imu_head.4.bias"
+    num_classes = config["num_classes"]
+    true_label_val = int(sample_label.item())
 
-        pre_clip_norm = float(np.sqrt(sum(np.sum(d.astype(np.float64) ** 2) for d in deltas)))
+    results = {}
+    scenarios = {
+        "no_privacy": true_grads,
+        "sapm": apply_sapm_transform(true_grads, SAPM_KEEP_RATIO, SAPM_QUANT_BITS),
+        "dp": apply_dp_transform(true_grads, DP_MAX_GRAD_NORM, DP_NOISE_MULTIPLIER),
+    }
 
-        if use_dp:
-            # Step 1: clip the WHOLE update (across all layers together) to L2 norm max_norm.
-            clip_factor = min(1.0, max_norm / (pre_clip_norm + 1e-12))
-            deltas = [d * clip_factor for d in deltas]
+    for name, target_grads in scenarios.items():
+        pred_label, leaked = infer_label_from_bias(target_grads, bias_key, num_classes)
+        label_correct = (pred_label == true_label_val) if leaked else False
+        attack_label = pred_label if leaked else int(np.random.randint(num_classes))
 
-            # Step 2: add iid Gaussian noise to every coordinate of the clipped update.
-            noise_std = noise_mult * max_norm
-            deltas = [d + np.random.normal(0.0, noise_std, size=d.shape).astype(np.float32) for d in deltas]
+        recon = gradient_matching_attack(
+            model, target_grads, attack_label, sample_imu.shape, ATTACK_ITERS, ATTACK_LR
+        )
+        mse = torch.mean((recon - sample_imu) ** 2).item()
+        true_var = torch.var(sample_imu).item()
+        normalized_mse = mse / (true_var + 1e-12)
 
-        post_norm = float(np.sqrt(sum(np.sum(d.astype(np.float64) ** 2) for d in deltas)))
-
-        metrics = {
-            "train_loss": total_loss / len(self.train_loader),
-            "pre_clip_norm": pre_clip_norm,
-            "post_dp_norm": post_norm,
+        results[name] = {
+            "mse": mse,
+            "normalized_mse": normalized_mse,
+            "label_leaked": leaked,
+            "label_correct": label_correct,
+            "reconstruction": recon.cpu().numpy(),
         }
-        return deltas, len(self.train_loader.dataset), metrics
 
-    def evaluate(self, parameters, eval_config):
-        self.set_parameters(parameters)
-        self.model.eval()
-        all_preds = []
-        all_labels = []
+    return results, true_label_val
 
-        with torch.no_grad():
-            for batch in self.train_loader:
-                imu = batch["imu"].to(DEVICE).float()
-                label = batch["label"].to(DEVICE).long()
 
-                output = self.model({"imu": imu})
-                pred = output.argmax(dim=1)
+def main(train_csv: str):
+    global DP_NOISE_MULTIPLIER
 
-                all_preds.extend(pred.cpu().numpy())
-                all_labels.extend(label.cpu().numpy())
+    train_dataset = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"])
+    print(f"Loaded {len(train_dataset)} training windows for attack evaluation.")
 
-        accuracy = accuracy_score(all_labels, all_preds)
-        return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}
+    model = IMUTransformerEncoder(config).to(DEVICE)
+    if MODEL_CHECKPOINT:
+        model.load_state_dict(torch.load(MODEL_CHECKPOINT, map_location=DEVICE))
+        print(f"Attacking a TRAINED model loaded from {MODEL_CHECKPOINT}")
+    else:
+        print("Attacking a RANDOMLY INITIALIZED model (worst-case / early-training scenario)")
 
-# ====================== STRATEGY ======================
-class SaveModelStrategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, use_dp=USE_DP, max_grad_norm=MAX_GRAD_NORM,
-                 noise_multiplier=NOISE_MULTIPLIER, **kwargs):
-        super().__init__(**kwargs)
-        self.test_loader = test_loader
-        self.global_model = IMUTransformerEncoder(config).to(DEVICE)
-        self.best_acc = 0.0
-        self.use_dp = use_dp
-        self.max_grad_norm = max_grad_norm
-        self.noise_multiplier = noise_multiplier
+    if DP_NOISE_MULTIPLIER is None:
+        num_params = sum(p.numel() for p in model.parameters())
+        DP_NOISE_MULTIPLIER = 1.0 / (num_params ** 0.5)
+        print(f"Auto-calibrated DP_NOISE_MULTIPLIER = {DP_NOISE_MULTIPLIER:.6f} ({num_params:,} params)")
 
-    def configure_fit(self, server_round, parameters, client_manager):
-        fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
-        for _, fit_ins in fit_ins_list:
-            fit_ins.config["use_dp"] = self.use_dp
-            fit_ins.config["max_grad_norm"] = self.max_grad_norm
-            fit_ins.config["noise_multiplier"] = self.noise_multiplier
-        return fit_ins_list
+    print(f"SAPM: keep_ratio={SAPM_KEEP_RATIO}, quant_bits={SAPM_QUANT_BITS}")
+    print(f"DP: max_grad_norm={DP_MAX_GRAD_NORM}, noise_multiplier={DP_NOISE_MULTIPLIER}")
+    print(f"Attack: {ATTACK_ITERS} iters, lr={ATTACK_LR}, {NUM_VICTIMS} victims\n")
 
-    def aggregate_fit(self, server_round, results, failures):
-        self.current_round = server_round
-        if not results:
-            return None, {}
+    indices = np.random.choice(len(train_dataset), size=NUM_VICTIMS, replace=False)
 
-        global_state = self.global_model.state_dict()
-        keys = list(global_state.keys())
-        weighted_deltas = {k: np.zeros(v.shape, dtype=np.float64) for k, v in global_state.items()}
-        total_examples = 0
-        pre_norms, post_norms = [], []
+    all_results = {"no_privacy": [], "sapm": [], "dp": []}
+    example_plot_data = None
 
-        for _, fit_res in results:
-            arrays = parameters_to_ndarrays(fit_res.parameters)
-            num_examples = fit_res.num_examples
-            pre_norms.append(fit_res.metrics.get("pre_clip_norm", 0.0))
-            post_norms.append(fit_res.metrics.get("post_dp_norm", 0.0))
+    for i, idx in enumerate(indices):
+        sample = train_dataset[idx]
+        sample_imu = sample["imu"].unsqueeze(0).to(DEVICE).float()
+        label_val = sample["label"].item() if torch.is_tensor(sample["label"]) else sample["label"]
+        sample_label = torch.tensor([label_val], device=DEVICE, dtype=torch.long)
 
-            for k, arr in zip(keys, arrays):
-                weighted_deltas[k] += arr.astype(np.float64) * num_examples
+        print(f"--- Victim {i+1}/{NUM_VICTIMS} (true label {label_val}) ---")
+        results, true_label_val = run_victim(model, sample_imu, sample_label)
 
-            total_examples += num_examples
+        for scenario, r in results.items():
+            all_results[scenario].append(r)
+            print(f"  {scenario:10s}: MSE={r['mse']:.6f}  normMSE={r['normalized_mse']:.4f}  "
+                  f"label_leaked={r['label_leaked']}  label_correct={r['label_correct']}")
 
-        new_state = {}
-        any_nonfinite = False
-        for k in keys:
-            avg_delta = weighted_deltas[k] / max(1, total_examples)
-            if not np.all(np.isfinite(avg_delta)):
-                any_nonfinite = True
-                avg_delta = np.zeros_like(avg_delta)
-            new_state[k] = global_state[k] + torch.tensor(avg_delta, dtype=global_state[k].dtype, device=global_state[k].device)
+        if i == 0:
+            example_plot_data = (sample_imu.cpu().numpy(), results)
 
-        if any_nonfinite:
-            print(f"WARNING: round {server_round} produced non-finite aggregated delta for one or more "
-                  f"tensors -- those tensors were left unchanged this round instead of applying garbage.")
+    print("\n========== SUMMARY (averaged over all victims) ==========")
+    print(f"{'Scenario':12s} {'Avg MSE':>12s} {'Avg normMSE':>14s} {'Label leak rate':>18s} {'Label correct rate':>20s}")
+    for scenario, rs in all_results.items():
+        avg_mse = np.mean([r["mse"] for r in rs])
+        avg_nmse = np.mean([r["normalized_mse"] for r in rs])
+        leak_rate = np.mean([r["label_leaked"] for r in rs])
+        correct_rate = np.mean([r["label_correct"] for r in rs])
+        print(f"{scenario:12s} {avg_mse:12.6f} {avg_nmse:14.4f} {leak_rate:18.2%} {correct_rate:20.2%}")
 
-        self.global_model.load_state_dict(new_state)
-        aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
+    print("\nInterpretation: higher MSE / normalized MSE = harder to reconstruct = stronger empirical "
+          "privacy. Lower label-leak/correct rate = stronger empirical privacy against the label side-channel.")
 
-        acc = self.evaluate_global(final=False)
-        avg_pre = float(np.mean(pre_norms)) if pre_norms else 0.0
-        avg_post = float(np.mean(post_norms)) if post_norms else 0.0
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | "
-              f"Avg pre-clip norm: {avg_pre:.4f} | Avg post-DP norm: {avg_post:.4f}")
-
-        if acc > self.best_acc:
-            self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
-
-        if server_round == NUM_ROUNDS:
-            print("\n========== FINAL EVALUATION ==========")
-            self.evaluate_global(final=True)
-
-        return aggregated_params, {"accuracy": acc, "avg_pre_clip_norm": avg_pre, "avg_post_dp_norm": avg_post}
-
-    def evaluate_global(self, final=False):
-        self.global_model.eval()
-
-        all_preds = []
-        all_labels = []
-
-        with torch.no_grad():
-            for batch in self.test_loader:
-                imu = batch["imu"].to(DEVICE).float()
-                labels = batch["label"].to(DEVICE).long()
-
-                outputs = self.global_model({"imu": imu})
-                preds = outputs.argmax(dim=1)
-
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-
-        accuracy = accuracy_score(all_labels, all_preds)
-
-        if not final:
-            return accuracy
-
-        precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
-        recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
-        f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-
-        print(f"Accuracy : {accuracy:.4f}")
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall   : {recall:.4f}")
-        print(f"F1 Score : {f1:.4f}")
-
-        print("\nClassification Report")
-        print(classification_report(all_labels, all_preds, zero_division=0))
-
-        cm = confusion_matrix(all_labels, all_preds)
-
-        print("\nConfusion Matrix")
-        print(cm)
-
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (DP-FedAvg)")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_dp.png")
+    if example_plot_data is not None:
+        true_imu, results = example_plot_data
+        channel = 0
+        plt.figure(figsize=(12, 6))
+        plt.plot(true_imu[0, :, channel], label="True signal", linewidth=2, color="black")
+        for scenario, r in results.items():
+            plt.plot(r["reconstruction"][0, :, channel], label=f"Reconstructed ({scenario})", alpha=0.7)
+        plt.title(f"Gradient-inversion reconstruction, IMU channel {channel} (victim 1)")
+        plt.xlabel("Timestep")
+        plt.ylabel("Sensor value")
+        plt.legend()
+        plt.savefig("gradient_inversion_comparison.png")
         plt.close()
+        print("\nSaved comparison plot to gradient_inversion_comparison.png")
 
-        return accuracy
-
-# ====================== MAIN ======================
-def main(train_csv: str, test_csv: str):
-    train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
-
-    test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
-
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-
-        client_idx = cid % len(client_datasets)
-
-        return IMUClient(client_datasets[client_idx]).to_client()
-
-    strategy = SaveModelStrategy(
-        test_loader=test_loader,
-        use_dp=USE_DP,
-        max_grad_norm=MAX_GRAD_NORM,
-        noise_multiplier=NOISE_MULTIPLIER,
-    )
-
-    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
-
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
 
 if __name__ == "__main__":
-    main("train.csv", "test.csv")
+    main("train.csv")
