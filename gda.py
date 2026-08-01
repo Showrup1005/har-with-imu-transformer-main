@@ -37,7 +37,8 @@ CAVEATS (read before treating results as a formal privacy proof):
   average/spread, not a single number, for a defensible thesis claim.
 - Uses random model weights (SAPM/DP tend to be *more* vulnerable to
   this kind of attack early in training and *less* vulnerable on a
-  well-trained model).
+  well-trained model) -- optionally point MODEL_CHECKPOINT at your saved
+  best_model.pth to attack a trained model instead, and report both.
 """
 
 import json
@@ -61,7 +62,9 @@ def math_attention_only():
     nn.TransformerEncoderLayer / nn.MultiheadAttention) don't implement
     that second-order derivative and raise a RuntimeError. The plain
     'math' SDPA backend does support it -- this context manager forces
-    that backend for the duration of the attack."""
+    that backend for the duration of the attack. Supports both the newer
+    (torch.nn.attention.sdpa_kernel) and older (torch.backends.cuda.sdp_kernel)
+    APIs depending on your torch version."""
     try:
         from torch.nn.attention import sdpa_kernel, SDPBackend
         with sdpa_kernel(SDPBackend.MATH):
@@ -87,20 +90,20 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(0)
 np.random.seed(0)
 
-MODEL_CHECKPOINT = None   
+MODEL_CHECKPOINT = "best_model.pth"   # attacking your SAPM keep_ratio=0.3 trained model
 
-# --- SAPM parameters  ---
-SAPM_KEEP_RATIO = 0.6
+# --- SAPM parameters (matched to the run best_model.pth came from) ---
+SAPM_KEEP_RATIO = 0.3
 SAPM_QUANT_BITS = 8
 
-# --- DP parameters  ---
+# --- DP parameters (match your DP run) ---
 DP_MAX_GRAD_NORM = 1.0
 DP_NOISE_MULTIPLIER = None  # None = auto-calibrate from param count, as in fl_train_dp.py
 
 # --- Attack optimization ---
 ATTACK_ITERS = 400
 ATTACK_LR = 0.05
-NUM_VICTIMS = 5   
+NUM_VICTIMS = 5   # run the attack on this many random samples and average results
 
 
 # ====================== SAPM TRANSFORM (same math as fl_train_sapm.py) ======================
