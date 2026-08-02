@@ -75,7 +75,7 @@ MAX_GRAD_NORM = 1.0     # C: L2 clipping norm applied to each client's full flat
 # SAPM. PRIVACY_LEVEL below picks a multiple of that minimal baseline;
 # "strong" is a reasonable default for a real privacy claim. Override
 # PRIVACY_LEVEL or set NOISE_MULTIPLIER directly for a custom point.
-PRIVACY_LEVEL = "strong"   # one of: "minimal", "moderate", "strong", "very_strong"
+PRIVACY_LEVEL = "moderate"   # one of: "minimal", "moderate", "strong", "very_strong"
 _PRIVACY_LEVEL_MULTIPLIERS = {
     "minimal": 1,
     "moderate": 10,
@@ -331,7 +331,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model_dp_strong.pth")
+            torch.save(self.global_model.state_dict(), f"best_model_dp_{PRIVACY_LEVEL}.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
@@ -386,7 +386,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         plt.title(f"Final Confusion Matrix (DP-FedAvg, {PRIVACY_LEVEL} privacy)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_dp_strong.png")
+        plt.savefig(f"final_confusion_matrix_dp_{PRIVACY_LEVEL}.png")
         plt.close()
 
         return accuracy
