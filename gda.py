@@ -101,7 +101,7 @@ DP_MAX_GRAD_NORM = 1.0
 _DP_LEVEL_MULTIPLIERS = {"minimal": 1, "moderate": 10, "strong": 30, "very_strong": 100}
 
 # --- Final-layer protection toggle ---
-PROTECT_FINAL_LAYER = False   # set True to test whether excluding the final
+PROTECT_FINAL_LAYER = True   # set True to test whether excluding the final
                               # layer from transmission closes the label leak
 FINAL_LAYER_KEYS = ["imu_head.4.weight", "imu_head.4.bias"]
 
