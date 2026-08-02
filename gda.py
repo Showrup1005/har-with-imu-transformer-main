@@ -1,47 +1,47 @@
 """
-Gradient-inversion attack harness: empirically measures how hard it is to
-reconstruct a client's raw IMU input window from what the server actually
-receives, under three conditions:
+Gradient-inversion attack harness (v2): empirically measures how hard it
+is to reconstruct a client's raw IMU input window from what the server
+actually receives, sweeping across:
 
-    1. NO PRIVACY   -- raw single local-training-step gradient
-    2. SAPM         -- Fisher-sparsified + quantized + permuted, then
-                       unpermuted/dequantized exactly as your aggregate_fit
-                       does (i.e. what the server actually reconstructs)
-    3. DP-FEDAVG    -- L2-clipped + Gaussian-noised gradient
-
-This uses the DLG (Deep Leakage from Gradients) / iDLG attack: the
-attacker starts from random noise as a guess for the victim's input,
-then repeatedly adjusts that guess so that its own gradient (computed by
-forward/backward-passing the guess through the SAME model weights the
-victim used) matches the gradient the attacker actually observed. If the
-match is close, the guess converges toward the true input.
+    1. NO PRIVACY     -- raw single local-training-step gradient
+    2. SAPM           -- Fisher-sparsified + quantized + permuted, then
+                         unpermuted/dequantized exactly as aggregate_fit
+                         does, at EACH keep_ratio in SAPM_KEEP_RATIOS
+    3. DP-FEDAVG      -- L2-clipped + Gaussian-noised gradient, at EACH
+                         privacy level in DP_PRIVACY_LEVELS (same presets
+                         as fl_train_dp_strong.py)
 
 THREAT MODEL: the attacker is the aggregating server (has the model
-weights and, for SAPM, the round seed -- the realistic strong-adversary
-case established in our earlier discussion, since the permutation gives
-no protection against the server itself).
+weights and, for SAPM, the round seed).
 
-CAVEATS (read before treating results as a formal privacy proof):
-- This is an empirical demonstration, not a formal privacy guarantee.
-  A low reconstruction error is strong evidence of weak privacy; a high
-  reconstruction error is evidence the mechanism raises the practical
-  cost of attack, not proof that reconstruction is impossible under any
-  attacker/optimizer/prior.
-- Uses a SINGLE local-training-step gradient (one forward/backward pass,
-  no optimizer.step() applied yet) rather than a multi-epoch delta --
-  this is deliberately the strongest, most literature-standard attack
-  scenario (multi-step deltas are already harder to invert, which is
-  itself worth a sentence in your thesis).
-- Results depend on attack hyperparameters (iterations, learning rate,
-  init). Run with a few different random victims/seeds and report the
-  average/spread, not a single number, for a defensible thesis claim.
-- Uses random model weights (SAPM/DP tend to be *more* vulnerable to
-  this kind of attack early in training and *less* vulnerable on a
-  well-trained model) -- optionally point MODEL_CHECKPOINT at your saved
-  best_model.pth to attack a trained model instead, and report both.
+NEW IN THIS VERSION:
+- Sweeps several SAPM/DP settings instead of one point each, so you get
+  an actual privacy-vs-reconstruction curve for both mechanisms.
+- PROTECT_FINAL_LAYER: when True, the final classification layer's
+  weight+bias are never transmitted at all (for every scenario) -- lets
+  you directly test whether this closes the label-leak side channel.
+- Paired Wilcoxon signed-rank test (scenario vs. no_privacy) on MSE,
+  since the same victims are used across all scenarios -- gives you a
+  p-value instead of an eyeballed mean difference.
+- Saves a raw per-victim, per-scenario CSV (gradient_inversion_results.csv)
+  for your own plots later.
+
+RUNTIME WARNING: this sweeps multiple settings, which multiplies cost.
+With defaults below (10 victims x (1 no-privacy + 3 SAPM + 4 DP) = 8
+scenarios x 400 attack iterations), expect this to take noticeably
+longer than the single-setting v1 script. Lower NUM_VICTIMS or the
+sweep lists first if you just want a quick smoke test.
+
+CAVEATS (same as before -- read before treating results as a formal
+privacy proof): this is an empirical demonstration using a single
+local-training-step gradient against a strong (server) attacker with
+400 optimization iterations; results depend on those choices and should
+be reported as such, not as a formal guarantee.
 """
 
+import csv
 import json
+import math
 import warnings
 import contextlib
 import numpy as np
@@ -49,6 +49,12 @@ import torch
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
+
+try:
+    import scipy.stats  # noqa: F401
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
@@ -58,13 +64,8 @@ from util.IMUDataset import IMUDataset
 def math_attention_only():
     """DLG-style attacks need to backprop through the gradient computation
     itself (a 'double backward'). PyTorch's fused/flash/memory-efficient
-    scaled-dot-product-attention kernels (used internally by
-    nn.TransformerEncoderLayer / nn.MultiheadAttention) don't implement
-    that second-order derivative and raise a RuntimeError. The plain
-    'math' SDPA backend does support it -- this context manager forces
-    that backend for the duration of the attack. Supports both the newer
-    (torch.nn.attention.sdpa_kernel) and older (torch.backends.cuda.sdp_kernel)
-    APIs depending on your torch version."""
+    attention kernels don't implement that second-order derivative -- this
+    forces the plain 'math' SDPA backend, which does."""
     try:
         from torch.nn.attention import sdpa_kernel, SDPBackend
         with sdpa_kernel(SDPBackend.MATH):
@@ -78,8 +79,6 @@ def math_attention_only():
         return
     except AttributeError:
         pass
-    # Fallback: no kernel-selection API available on this torch version --
-    # proceed without forcing (may still fail on some torch versions/models).
     yield
 
 # ====================== CONFIG ======================
@@ -90,23 +89,33 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(0)
 np.random.seed(0)
 
-MODEL_CHECKPOINT = "best_model.pth"   # attacking your SAPM keep_ratio=0.3 trained model
+MODEL_CHECKPOINT = "best_model.pth"   # None = random init (worst-case); or path to a trained checkpoint
 
-# --- SAPM parameters (matched to the run best_model.pth came from) ---
-SAPM_KEEP_RATIO = 0.3
+# --- SAPM sweep ---
+SAPM_KEEP_RATIOS = [0.1, 0.3, 0.6]
 SAPM_QUANT_BITS = 8
 
-# --- DP parameters (match your DP run) ---
+# --- DP sweep (same presets as fl_train_dp_strong.py) ---
+DP_PRIVACY_LEVELS = ["minimal", "moderate", "strong", "very_strong"]
 DP_MAX_GRAD_NORM = 1.0
-DP_NOISE_MULTIPLIER = None  # None = auto-calibrate from param count, as in fl_train_dp.py
+_DP_LEVEL_MULTIPLIERS = {"minimal": 1, "moderate": 10, "strong": 30, "very_strong": 100}
+
+# --- Final-layer protection toggle ---
+PROTECT_FINAL_LAYER = False   # set True to test whether excluding the final
+                              # layer from transmission closes the label leak
+FINAL_LAYER_KEYS = ["imu_head.4.weight", "imu_head.4.bias"]
 
 # --- Attack optimization ---
 ATTACK_ITERS = 400
 ATTACK_LR = 0.05
-NUM_VICTIMS = 5   # run the attack on this many random samples and average results
+NUM_VICTIMS = 30   
 
 
-# ====================== SAPM TRANSFORM (same math as fl_train_sapm.py) ======================
+def gaussian_mechanism_epsilon(noise_multiplier, delta):
+    return math.sqrt(2 * math.log(1.25 / delta)) / noise_multiplier
+
+
+# ====================== SAPM TRANSFORM ======================
 def compute_topk_mask(fisher_flat, keep_ratio):
     n = fisher_flat.size
     k = max(1, int(np.ceil(keep_ratio * n)))
@@ -142,18 +151,15 @@ def dequantize_with_params(x_q, scale, zmin, num_bits=8):
     step = scale / qmax if scale != 0 else 1.0
     return x_q * step + zmin
 
-def apply_sapm_transform(true_grads, keep_ratio, quant_bits):
-    """Simulates the FULL round trip: client-side mask+quantize+permute,
-    then server-side unpermute+dequantize -- returns what the server
-    actually reconstructs and uses (a client-supplied seed isn't even
-    needed here since permutation is a no-op against the server: shuffle
-    then un-shuffle with the correct seed always returns the original
-    order, so we skip simulating it explicitly)."""
+def apply_sapm_transform(true_grads, keep_ratio, quant_bits, protect_final_layer):
     out = {}
     for name, g in true_grads.items():
+        if protect_final_layer and name in FINAL_LAYER_KEYS:
+            out[name] = torch.zeros_like(g)
+            continue
         g_np = g.cpu().numpy().astype(np.float32)
         flat = g_np.reshape(-1)
-        fisher_flat = flat ** 2  # single-step Fisher proxy = grad^2
+        fisher_flat = flat ** 2
         mask = compute_topk_mask(fisher_flat, keep_ratio)
         sparse = np.where(mask, flat, 0.0).astype(np.float32)
         scale, zmin = compute_quant_params(flat)
@@ -163,26 +169,26 @@ def apply_sapm_transform(true_grads, keep_ratio, quant_bits):
     return out
 
 
-# ====================== DP TRANSFORM (same math as fl_train_dp.py) ======================
-def apply_dp_transform(true_grads, max_norm, noise_multiplier):
+# ====================== DP TRANSFORM ======================
+def apply_dp_transform(true_grads, max_norm, noise_multiplier, protect_final_layer):
     names = list(true_grads.keys())
     arrays = [true_grads[n].cpu().numpy().astype(np.float32) for n in names]
     pre_norm = float(np.sqrt(sum(np.sum(a.astype(np.float64) ** 2) for a in arrays)))
     clip_factor = min(1.0, max_norm / (pre_norm + 1e-12))
     arrays = [a * clip_factor for a in arrays]
     noise_std = noise_multiplier * max_norm
-    arrays = [a + np.random.normal(0.0, noise_std, size=a.shape).astype(np.float32) for a in arrays]
-    return {n: torch.tensor(a, dtype=true_grads[n].dtype, device=true_grads[n].device) for n, a in zip(names, arrays)}
+    out = {}
+    for n, a in zip(names, arrays):
+        if protect_final_layer and n in FINAL_LAYER_KEYS:
+            out[n] = torch.zeros_like(true_grads[n])
+            continue
+        noised = a + np.random.normal(0.0, noise_std, size=a.shape).astype(np.float32)
+        out[n] = torch.tensor(noised, dtype=true_grads[n].dtype, device=true_grads[n].device)
+    return out
 
 
 # ====================== ATTACK ======================
 def infer_label_from_bias(target_grads, bias_key, num_classes):
-    """iDLG trick: for cross-entropy loss on a single sample, the true
-    class's logit-bias gradient is negative and all others are positive
-    (since dL/dz_y = softmax(z)_y - 1 < 0 for the true class, softmax(z)_c
-    > 0 otherwise). Returns (predicted_label, leaked) where leaked=False
-    means the bias gradient was entirely zeroed out (e.g. by SAPM's
-    sparsification) and no label could be inferred from it."""
     if bias_key not in target_grads:
         return None, False
     bias_grad = target_grads[bias_key].detach().cpu().numpy()
@@ -216,7 +222,18 @@ def gradient_matching_attack(model, target_grads, true_label, input_shape, iters
     return dummy_input.detach()
 
 
-def run_victim(model, sample_imu, sample_label):
+def build_scenarios(true_grads, dp_noise_multipliers):
+    scenarios = {"no_privacy": true_grads}
+    for kr in SAPM_KEEP_RATIOS:
+        scenarios[f"sapm_kr{kr}"] = apply_sapm_transform(true_grads, kr, SAPM_QUANT_BITS, PROTECT_FINAL_LAYER)
+    for level in DP_PRIVACY_LEVELS:
+        scenarios[f"dp_{level}"] = apply_dp_transform(
+            true_grads, DP_MAX_GRAD_NORM, dp_noise_multipliers[level], PROTECT_FINAL_LAYER
+        )
+    return scenarios
+
+
+def run_victim(model, sample_imu, sample_label, dp_noise_multipliers):
     model.zero_grad()
     output = model({"imu": sample_imu})
     loss = torch.nn.functional.cross_entropy(output, sample_label)
@@ -224,20 +241,15 @@ def run_victim(model, sample_imu, sample_label):
     true_grads = {n: g.detach().clone() for (n, _), g in zip(model.named_parameters(), grads)}
 
     bias_key = "imu_head.4.bias"
-    num_classes = config["num_classes"]
     true_label_val = int(sample_label.item())
 
     results = {}
-    scenarios = {
-        "no_privacy": true_grads,
-        "sapm": apply_sapm_transform(true_grads, SAPM_KEEP_RATIO, SAPM_QUANT_BITS),
-        "dp": apply_dp_transform(true_grads, DP_MAX_GRAD_NORM, DP_NOISE_MULTIPLIER),
-    }
+    scenarios = build_scenarios(true_grads, dp_noise_multipliers)
 
     for name, target_grads in scenarios.items():
-        pred_label, leaked = infer_label_from_bias(target_grads, bias_key, num_classes)
+        pred_label, leaked = infer_label_from_bias(target_grads, bias_key, config["num_classes"])
         label_correct = (pred_label == true_label_val) if leaked else False
-        attack_label = pred_label if leaked else int(np.random.randint(num_classes))
+        attack_label = pred_label if leaked else int(np.random.randint(config["num_classes"]))
 
         recon = gradient_matching_attack(
             model, target_grads, attack_label, sample_imu.shape, ATTACK_ITERS, ATTACK_LR
@@ -257,9 +269,19 @@ def run_victim(model, sample_imu, sample_label):
     return results, true_label_val
 
 
-def main(train_csv: str):
-    global DP_NOISE_MULTIPLIER
+def wilcoxon_p_value(baseline_mses, scenario_mses):
+    """Paired Wilcoxon signed-rank test, scenario vs. no_privacy MSE.
+    Returns None if scipy isn't installed or all diffs are zero."""
+    if not _SCIPY_AVAILABLE:
+        return None
+    diffs = np.array(scenario_mses) - np.array(baseline_mses)
+    if np.allclose(diffs, 0):
+        return None
+    _, p = scipy.stats.wilcoxon(scenario_mses, baseline_mses)
+    return p
 
+
+def main(train_csv: str):
     train_dataset = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"])
     print(f"Loaded {len(train_dataset)} training windows for attack evaluation.")
 
@@ -270,19 +292,26 @@ def main(train_csv: str):
     else:
         print("Attacking a RANDOMLY INITIALIZED model (worst-case / early-training scenario)")
 
-    if DP_NOISE_MULTIPLIER is None:
-        num_params = sum(p.numel() for p in model.parameters())
-        DP_NOISE_MULTIPLIER = 1.0 / (num_params ** 0.5)
-        print(f"Auto-calibrated DP_NOISE_MULTIPLIER = {DP_NOISE_MULTIPLIER:.6f} ({num_params:,} params)")
+    num_params = sum(p.numel() for p in model.parameters())
+    baseline_sigma = 1.0 / (num_params ** 0.5)
+    dp_noise_multipliers = {level: baseline_sigma * mult for level, mult in _DP_LEVEL_MULTIPLIERS.items()}
 
-    print(f"SAPM: keep_ratio={SAPM_KEEP_RATIO}, quant_bits={SAPM_QUANT_BITS}")
-    print(f"DP: max_grad_norm={DP_MAX_GRAD_NORM}, noise_multiplier={DP_NOISE_MULTIPLIER}")
+    print(f"Model has {num_params:,} parameters | baseline (minimal) noise_multiplier = {baseline_sigma:.6f}")
+    print(f"SAPM keep_ratios to sweep: {SAPM_KEEP_RATIOS} (quant_bits={SAPM_QUANT_BITS})")
+    print(f"DP levels to sweep: {DP_PRIVACY_LEVELS}")
+    for level in DP_PRIVACY_LEVELS:
+        sigma = dp_noise_multipliers[level]
+        eps = gaussian_mechanism_epsilon(sigma, 1e-5)
+        print(f"  {level:12s} sigma={sigma:.6f}  per-round epsilon (approx)={eps:.2f}")
+    print(f"PROTECT_FINAL_LAYER = {PROTECT_FINAL_LAYER}")
     print(f"Attack: {ATTACK_ITERS} iters, lr={ATTACK_LR}, {NUM_VICTIMS} victims\n")
 
     indices = np.random.choice(len(train_dataset), size=NUM_VICTIMS, replace=False)
 
-    all_results = {"no_privacy": [], "sapm": [], "dp": []}
+    all_scenario_names = None
+    all_results = {}
     example_plot_data = None
+    csv_rows = []
 
     for i, idx in enumerate(indices):
         sample = train_dataset[idx]
@@ -293,42 +322,66 @@ def main(train_csv: str):
         sample_label = torch.tensor([label_val], device=DEVICE, dtype=torch.long)
 
         print(f"--- Victim {i+1}/{NUM_VICTIMS} (true label {label_val}) ---")
-        results, true_label_val = run_victim(model, sample_imu, sample_label)
+        results, true_label_val = run_victim(model, sample_imu, sample_label, dp_noise_multipliers)
+
+        if all_scenario_names is None:
+            all_scenario_names = list(results.keys())
+            all_results = {name: [] for name in all_scenario_names}
 
         for scenario, r in results.items():
             all_results[scenario].append(r)
-            print(f"  {scenario:10s}: MSE={r['mse']:.6f}  normMSE={r['normalized_mse']:.4f}  "
+            csv_rows.append({
+                "victim": i, "true_label": true_label_val, "scenario": scenario,
+                "mse": r["mse"], "normalized_mse": r["normalized_mse"],
+                "label_leaked": r["label_leaked"], "label_correct": r["label_correct"],
+            })
+            print(f"  {scenario:14s}: MSE={r['mse']:.6f}  normMSE={r['normalized_mse']:.4f}  "
                   f"label_leaked={r['label_leaked']}  label_correct={r['label_correct']}")
 
         if i == 0:
             example_plot_data = (sample_imu.cpu().numpy(), results)
 
+    with open("gradient_inversion_results.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    print("\nSaved raw per-victim results to gradient_inversion_results.csv")
+
     print("\n========== SUMMARY (averaged over all victims) ==========")
-    print(f"{'Scenario':12s} {'Avg MSE':>12s} {'Avg normMSE':>14s} {'Label leak rate':>18s} {'Label correct rate':>20s}")
+    header = f"{'Scenario':16s} {'Avg MSE':>12s} {'Avg normMSE':>14s} {'Label leak':>12s} {'Label correct':>14s} {'p vs no_priv':>14s}"
+    print(header)
+    baseline_mses = [r["mse"] for r in all_results["no_privacy"]]
     for scenario, rs in all_results.items():
         avg_mse = np.mean([r["mse"] for r in rs])
         avg_nmse = np.mean([r["normalized_mse"] for r in rs])
         leak_rate = np.mean([r["label_leaked"] for r in rs])
         correct_rate = np.mean([r["label_correct"] for r in rs])
-        print(f"{scenario:12s} {avg_mse:12.6f} {avg_nmse:14.4f} {leak_rate:18.2%} {correct_rate:20.2%}")
+        scenario_mses = [r["mse"] for r in rs]
+        p = wilcoxon_p_value(baseline_mses, scenario_mses) if scenario != "no_privacy" else None
+        p_str = f"{p:.4f}" if p is not None else ("--" if scenario == "no_privacy" else "n/a (no scipy)")
+        print(f"{scenario:16s} {avg_mse:12.6f} {avg_nmse:14.4f} {leak_rate:12.1%} {correct_rate:14.1%} {p_str:>14s}")
 
-    print("\nInterpretation: higher MSE / normalized MSE = harder to reconstruct = stronger empirical "
-          "privacy. Lower label-leak/correct rate = stronger empirical privacy against the label side-channel.")
+    print("Interpretation: higher MSE = harder to reconstruct = stronger empirical privacy.")
+    print("p < 0.05 vs no_privacy means that scenario's MSE is statistically distinguishable from doing nothing "
+          "(with only NUM_VICTIMS paired samples -- increase NUM_VICTIMS for a more defensible p-value).")
+    if not _SCIPY_AVAILABLE:
+        print("(Install scipy for the paired significance test: pip install scipy)")
 
     if example_plot_data is not None:
         true_imu, results = example_plot_data
         channel = 0
-        plt.figure(figsize=(12, 6))
-        plt.plot(true_imu[0, :, channel], label="True signal", linewidth=2, color="black")
+        plt.figure(figsize=(14, 7))
+        plt.plot(true_imu[0, :, channel], label="True signal", linewidth=2.5, color="black")
         for scenario, r in results.items():
-            plt.plot(r["reconstruction"][0, :, channel], label=f"Reconstructed ({scenario})", alpha=0.7)
+            plt.plot(r["reconstruction"][0, :, channel], label=f"Reconstructed ({scenario})", alpha=0.6)
         plt.title(f"Gradient-inversion reconstruction, IMU channel {channel} (victim 1)")
         plt.xlabel("Timestep")
         plt.ylabel("Sensor value")
-        plt.legend()
+        plt.legend(fontsize=8)
+        plt.tight_layout()
         plt.savefig("gradient_inversion_comparison.png")
         plt.close()
-        print("\nSaved comparison plot to gradient_inversion_comparison.png")
+        print("Saved comparison plot to gradient_inversion_comparison.png")
 
 
 if __name__ == "__main__":
