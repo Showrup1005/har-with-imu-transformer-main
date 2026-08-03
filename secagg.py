@@ -431,11 +431,24 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         # exact here too, just over a shorter vector.
         summed = np.zeros(self.k, dtype=np.float64)
         mask_times = []
+        train_losses = []
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
             summed += arrays[0].astype(np.float64)
             mask_times.append(fit_res.metrics.get("mask_time_sec", 0.0))
+            train_losses.append(fit_res.metrics.get("train_loss", float("nan")))
         avg_sparse_delta = (summed / n_clients).astype(np.float32)
+
+        # DIAGNOSTIC: the L2 norm of the recovered (unmasked, averaged)
+        # true delta at this round's support. If this is ~0 every round,
+        # the freeze is upstream of aggregation (clients aren't producing
+        # real updates, or the update never survives to this point). If
+        # it's clearly nonzero but accuracy still never moves, the freeze
+        # is downstream (these updates aren't reaching argmax-changing
+        # magnitude -- e.g. too small a learning rate, or too few
+        # coordinates mattering for classification).
+        delta_norm = float(np.linalg.norm(avg_sparse_delta))
+        avg_train_loss = float(np.nanmean(train_losses)) if train_losses else float("nan")
 
         # Scatter the K averaged values back into a full-size dense
         # delta; every non-selected coordinate is implicitly zero this
@@ -462,6 +475,8 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         avg_mask_time = float(np.mean(mask_times)) if mask_times else 0.0
         print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | "
               f"K={self.k} ({self.k/self.total_dim*100:.1f}% of D) | "
+              f"Avg train_loss: {avg_train_loss:.6f} | "
+              f"Delta L2 norm: {delta_norm:.6e} | "
               f"Avg client-side mask time: {avg_mask_time*1000:.2f}ms")
 
         if acc > self.best_acc:
@@ -525,6 +540,16 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         all_labels = np.array(all_labels)
         accuracy = accuracy_score(all_labels, all_preds)
         if not final:
+            # DIAGNOSTIC: if the model has collapsed to (near-)always
+            # predicting one class, num_distinct_preds will be 1 (or very
+            # low) and max_class_share will be high -- a strong sign the
+            # freeze is in the model itself (dead/saturated units, or a
+            # learning-rate/init problem) rather than in the FL/SecAgg
+            # plumbing above it.
+            unique, counts = np.unique(all_preds, return_counts=True)
+            max_share = counts.max() / all_preds.size
+            print(f"  [diag] distinct predicted classes: {unique.size} | "
+                  f"largest single-class share: {max_share*100:.1f}%")
             return accuracy
 
         precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
