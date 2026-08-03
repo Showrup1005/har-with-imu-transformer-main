@@ -55,6 +55,24 @@ THE SIMPLIFICATION USED HERE, STATED EXPLICITLY:
     guarantees the whole parameter space gets sampled over the run
     rather than the support permanently collapsing.
 
+    A SECOND, UNRELATED BUG (inherited from the base secagg.py this file
+    extends, not introduced by sparsification) also caused flat accuracy:
+    the strategy created its own `self.global_model` with an independent
+    random init, while Flower's default `initialize_parameters` behavior
+    separately queried ONE CLIENT's own random init to broadcast for
+    round 1. Clients trained from -- and computed their deltas relative
+    to -- that client's random init, but aggregate_fit added those deltas
+    onto the strategy's unrelated random init instead. The resulting
+    model (unrelated base + delta computed on a different trajectory) is
+    internally incoherent -- matched structures like attention
+    projections and LayerNorm gamma/beta pairs get combined with values
+    they were never trained alongside -- and collapses toward a
+    near-constant output that per-round deltas can barely move. The fix
+    is `SaveModelStrategy.initialize_parameters`, which hands out the
+    strategy's own global_model weights as the round-1 broadcast, so
+    every round's deltas are computed relative to the same trajectory
+    the server actually accumulates onto.
+
     This is a real accuracy/communication trade-off relative to the
     papers' approach: letting each client keep its OWN locally-optimal
     top-K (rather than a shared, exploit/explore-driven one) would track
@@ -355,6 +373,30 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"({top_k_fraction*100:.1f}% kept per round) | "
               f"exploit={self.exploit_k}, explore={self.explore_k} "
               f"(full coverage in ~{-(-total_dim // self.explore_k)} rounds)")
+
+    def initialize_parameters(self, client_manager):
+        """Hand out THIS strategy's own global_model weights as the
+        round-1 broadcast, instead of letting Flower's default behavior
+        query a client for its own separately-initialized random model.
+
+        Without this override, clients would train starting from one
+        random init (call it A, whichever client got queried) and send
+        back deltas relative to A, while aggregate_fit adds those deltas
+        onto self.global_model -- an UNRELATED random init B. The
+        resulting model (B + delta_from_A) mixes two incompatible random
+        draws: attention projections, LayerNorm gamma/beta pairs, and
+        embedding/positional alignments that were only ever coherent
+        relative to A end up combined with B's unrelated values
+        everywhere the round hasn't touched yet. That produces a
+        badly-incoherent network whose output collapses toward a
+        near-constant prediction that small sparse per-round deltas
+        can barely shift -- which is exactly the flat-accuracy symptom.
+        Forcing round 1's broadcast to equal self.global_model's own
+        state keeps every round's delta computed relative to the same
+        trajectory the server actually accumulates onto.
+        """
+        arrays = [val.cpu().numpy() for _, val in self.global_model.state_dict().items()]
+        return ndarrays_to_parameters(arrays)
 
     def _next_explore_batch(self, n, exclude_set):
         """Pull n coordinates from the fixed round-robin visiting order,
