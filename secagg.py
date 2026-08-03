@@ -26,26 +26,45 @@ THE SIMPLIFICATION USED HERE, STATED EXPLICITLY:
     this implementation avoids the mismatch altogether by making the
     top-K support a single PUBLIC, SERVER-DETERMINED set S that every
     client is told to use for a given round (sent alongside the global
-    model in configure_fit, so it costs no extra round trip). Concretely:
-        - Round 1 has no aggregate history yet, so S is a fixed random
-          K-subset of coordinates (seeded, so every client agrees on it
-          without communication).
-        - From round 2 onward, S is the top-K coordinates by |magnitude|
-          of the PREVIOUS round's aggregated (already-public) update --
-          i.e. the same delta the server just wrote into the global
-          model. Because that aggregate is public information everyone
-          already sees, choosing S from it leaks nothing beyond what
-          plain FedAvg already reveals.
-    Since every client masks and sends values at the exact same K
-    indices, the original pairwise-mask cancellation proof from
-    secagg.py applies completely unchanged -- just with vectors of length
-    K instead of length D. This is a real accuracy/communication
-    trade-off relative to the papers' approach: letting each client keep
-    its OWN locally-optimal top-K (rather than a shared, slightly-stale
-    one) would track each client's individual large-gradient coordinates
-    more precisely. What we keep is the thing that matters most for a
-    demo: exact mask cancellation with zero extra cryptographic
-    machinery, and genuine communication savings that scale with K/D.
+    model in configure_fit, so it costs no extra round trip). Since every
+    client masks and sends values at the exact same K indices, the
+    original pairwise-mask cancellation proof from secagg.py applies
+    completely unchanged -- just with vectors of length K instead of
+    length D.
+
+    S is chosen by an EXPLOIT / EXPLORE split of the K budget each round:
+        - EXPLOIT (~70% of K): the coordinates with the largest observed
+          |delta| out of everything measured so far, from a persistent
+          magnitude_estimate[] array that is updated ONLY at coordinates
+          actually included in a round's support, and left untouched
+          everywhere else.
+        - EXPLORE (~30% of K): coordinates drawn from a fixed, publicly
+          seeded random visiting order that cycles through ALL D
+          coordinates over time (a shared pointer, advanced every
+          round), guaranteeing every parameter gets directly measured at
+          least once roughly every D / explore_k rounds.
+    An earlier version of this file picked next-round's S as "top-K by
+    |magnitude| of this round's aggregated delta" -- but that delta is
+    zero everywhere except at the current S (nothing else was ever
+    communicated), so "top-K of a mostly-zero vector" just re-selects
+    the same S forever. In a real run that froze training onto whatever
+    random 10% of parameters the round-1 bootstrap happened to pick,
+    and accuracy never moved off a near-uniform-guess baseline. The
+    exploit/explore split above is the fix: magnitude_estimate is never
+    implicitly zeroed for coordinates outside S, and the explore slice
+    guarantees the whole parameter space gets sampled over the run
+    rather than the support permanently collapsing.
+
+    This is a real accuracy/communication trade-off relative to the
+    papers' approach: letting each client keep its OWN locally-optimal
+    top-K (rather than a shared, exploit/explore-driven one) would track
+    each client's individual large-gradient coordinates more precisely
+    and without the discovery lag inherent in round-robin exploration.
+    What we keep is the thing that matters most for a demo: exact mask
+    cancellation with zero extra cryptographic machinery, genuine
+    communication savings that scale with K/D, and (with the fix above)
+    guaranteed full-parameter-space coverage over the course of
+    training.
 
 WHAT DOESN'T CHANGE FROM secagg.py:
     - The ECDH key exchange, HKDF derivation, and per-round PRG masking
@@ -62,13 +81,15 @@ WHAT DOESN'T CHANGE FROM secagg.py:
 
 NEW LIMITATION INTRODUCED BY SPARSIFICATION:
     - Non-selected coordinates are implicitly treated as zero-delta for
-      that round. Because S is refreshed every round based on the latest
-      aggregate, a coordinate that matters but was quiet last round can
-      still be picked up once it starts moving -- but there will always
-      be a 1-round lag between "this coordinate started mattering" and
-      "this coordinate got included in S". With a small K this can slow
-      convergence relative to full-gradient SecAgg; TOP_K_FRACTION is the
-      knob that trades communication savings against that lag.
+      that round. The explore mechanism bounds how stale this can get:
+      every coordinate is guaranteed to be directly measured at least
+      once every D / explore_k rounds (with the defaults below, roughly
+      every ~33 rounds for D≈1.5M), so a coordinate that starts mattering
+      will eventually be discovered and, once it shows a large delta,
+      pulled into the exploit set for continued refinement. With a small
+      K or a small EXPLORE_FRACTION_OF_K this discovery lag grows; those
+      two knobs are the trade-off against per-round communication
+      savings.
 """
 
 import flwr as fl
@@ -109,6 +130,12 @@ MASK_SCALE = 10.0        # std of the pairwise mask noise (cancels exactly
 TOP_K_FRACTION = 0.10    # fraction of total model parameters kept each
                           # round. Lower = more communication savings,
                           # more staleness lag (see docstring above).
+EXPLORE_FRACTION_OF_K = 0.30  # fraction of each round's K budget spent
+                          # on round-robin exploration of coordinates
+                          # not yet directly measured, vs. exploiting
+                          # the best coordinates found so far. Higher =
+                          # faster full-space coverage, less budget
+                          # spent refining known-important coordinates.
 
 print(f"Using device: {DEVICE}")
 print(f"Privacy strategy: Secure Aggregation (X25519 ECDH pairwise masking) "
@@ -295,18 +322,52 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.param_shapes = param_shapes
         self.total_dim = total_dim
         self.k = max(1, int(top_k_fraction * total_dim))
+        self.explore_k = max(1, int(EXPLORE_FRACTION_OF_K * self.k))
+        self.exploit_k = self.k - self.explore_k
 
-        # Round 1: no aggregate history exists yet to rank by magnitude,
-        # so bootstrap with a fixed, publicly-seeded random K-subset.
-        # Every client derives the identical set independently -- no
-        # extra communication needed, it's just a shared constant.
-        bootstrap_rng = np.random.RandomState(123)
-        self.current_support = np.sort(
-            bootstrap_rng.choice(total_dim, size=self.k, replace=False)
-        ).astype(np.int64)
+        # Persistent, server-side-only bookkeeping (never communicated
+        # as-is -- only the resulting support S is sent to clients).
+        # magnitude_estimate is updated ONLY at coordinates we actually
+        # measure in a given round; everywhere else keeps its last known
+        # value rather than being implicitly treated as zero. This is
+        # what prevents the support from collapsing onto a fixed subset
+        # (see module docstring for the bug this fixes).
+        self.magnitude_estimate = np.zeros(total_dim, dtype=np.float64)
+        self.known_mask = np.zeros(total_dim, dtype=bool)
+
+        # Fixed, publicly-seeded random visiting order used for
+        # round-robin exploration -- guarantees every one of the D
+        # coordinates gets directly measured over the course of
+        # training, regardless of where it sits in the flattened vector
+        # (a raw index-order sweep would spend many rounds stuck inside
+        # just the first tensor or two).
+        order_rng = np.random.RandomState(2024)
+        self.explore_order = order_rng.permutation(total_dim).astype(np.int64)
+        self.explore_ptr = 0
+
+        # Round 1: no observations exist yet, so spend the entire K
+        # budget as an initial exploration batch rather than splitting
+        # into an exploit set that has nothing informative to exploit.
+        self.current_support = np.sort(self.explore_order[:self.k]).astype(np.int64)
+        self.explore_ptr = self.k % total_dim
 
         print(f"Top-K SecAgg: D={total_dim} total params, K={self.k} "
-              f"({top_k_fraction*100:.1f}% kept per round)")
+              f"({top_k_fraction*100:.1f}% kept per round) | "
+              f"exploit={self.exploit_k}, explore={self.explore_k} "
+              f"(full coverage in ~{-(-total_dim // self.explore_k)} rounds)")
+
+    def _next_explore_batch(self, n, exclude_set):
+        """Pull n coordinates from the fixed round-robin visiting order,
+        skipping any already claimed by the exploit set this round."""
+        picked = []
+        scanned = 0
+        while len(picked) < n and scanned < self.total_dim:
+            cand = int(self.explore_order[self.explore_ptr])
+            self.explore_ptr = (self.explore_ptr + 1) % self.total_dim
+            scanned += 1
+            if cand not in exclude_set:
+                picked.append(cand)
+        return picked
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
@@ -365,11 +426,35 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             self.best_acc = acc
             torch.save(self.global_model.state_dict(), "best_model_secagg_topk.pth")
 
-        # Pick NEXT round's support: top-K by |magnitude| of THIS round's
-        # aggregate. This is public information (everyone already sees
-        # the new global model), so choosing it costs no extra privacy.
-        next_support = np.argpartition(np.abs(full_delta), -self.k)[-self.k:]
-        self.current_support = np.sort(next_support).astype(np.int64)
+        # ---- Update magnitude knowledge, then pick NEXT round's support ----
+        # Only touch the estimate at coordinates we actually measured this
+        # round; everything else keeps its previous value untouched.
+        self.magnitude_estimate[self.current_support] = np.abs(full_delta[self.current_support])
+        self.known_mask[self.current_support] = True
+
+        # EXPLOIT: the exploit_k coordinates with the largest measured
+        # |delta| among everything observed so far.
+        observed_idx = np.flatnonzero(self.known_mask)
+        if observed_idx.size <= self.exploit_k:
+            exploit = observed_idx
+        else:
+            top_within_observed = np.argpartition(
+                self.magnitude_estimate[observed_idx], -self.exploit_k
+            )[-self.exploit_k:]
+            exploit = observed_idx[top_within_observed]
+        exploit_set = set(int(i) for i in exploit)
+
+        # EXPLORE: round-robin through the fixed visiting order to fill
+        # the rest of the budget with coordinates not already exploited,
+        # guaranteeing eventual full coverage of the parameter space.
+        explore = self._next_explore_batch(self.k - len(exploit_set), exploit_set)
+
+        self.current_support = np.array(
+            sorted(exploit_set) + sorted(explore), dtype=np.int64
+        )
+        coverage_pct = observed_idx.size / self.total_dim * 100
+        print(f"  -> next support: exploit={len(exploit_set)}, explore={len(explore)} | "
+              f"cumulative coverage so far: {coverage_pct:.1f}% of all params")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
