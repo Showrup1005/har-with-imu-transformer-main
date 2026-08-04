@@ -113,6 +113,34 @@ run):
     wrong on its own once role assignment was fixed, which is exactly
     what this run demonstrated.
 
+    BUG #5 -- (THIS was the actual, sole root cause of every "flat
+    accuracy" run from the very first one -- BUG #4's diagnosis above was
+    itself a red herring). `configure_fit`/`configure_evaluate` looped
+    over `fit_ins_list`/`eval_ins_list` and wrote
+    `fit_ins.config["client_role"] = ...` for each client -- but Flower's
+    default `FedAvg.configure_fit` returns tuples that all reference the
+    SAME underlying `config` dict OBJECT (every client normally gets
+    identical config, so Flower shares one instance rather than copying
+    it per client). Mutating `fit_ins.config[...]` in the loop therefore
+    overwrote that ONE shared dict repeatedly; every client ended up
+    executing with whichever role was written LAST, not its own. This was
+    proven directly (not inferred) once a per-round check was added that
+    compares each result's self-reported `client_role` metric against
+    the expected {0, 1, 2}: every round showed all three results
+    reporting the IDENTICAL role (e.g. `[1, 1, 1]`, next round
+    `[2, 2, 2]`) despite a genuinely distinct, collision-free role map.
+    With all clients sharing one role, they all compute the SAME
+    `pairwise_secrets` and hence the IDENTICAL `combined_mask`
+    (deterministic given identical role/secrets/round_num) -- summing 3
+    identical masks and then dividing by `n_clients=3` in the averaging
+    step leaves EXACTLY one mask's worth of residual noise, which matches
+    the observed delta norm (~5500) exactly, with no discrepancy. Fixed
+    by building a genuinely independent `config` dict (and a fresh
+    `FitIns`/`EvaluateIns` wrapping it) per client instead of mutating a
+    shared reference. BUG #3's role-ASSIGNMENT fix was necessary but
+    insufficient on its own -- the role map was always correct; it just
+    never reliably reached the clients it was assigned to.
+
 WHAT DOESN'T CHANGE FROM secagg.py:
     - The ECDH key exchange, HKDF derivation, and per-round PRG masking
       math are identical (see generate_pairwise_secrets / generate_mask
@@ -477,17 +505,39 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
         self._ensure_roles(fit_ins_list)
+        # BUG #5 FIX: Flower's default FedAvg.configure_fit returns tuples
+        # that all reference the SAME underlying config dict object (since
+        # every client normally gets identical config). Mutating
+        # `fit_ins.config[...]` in a loop therefore overwrote that one
+        # shared dict repeatedly -- every client ended up seeing whichever
+        # role was written LAST, not its own. This is what actually
+        # produced every prior "flat accuracy" run: all 3 clients used the
+        # SAME role/secrets/mask every round (proven directly by the
+        # per-round role check reporting [1,1,1] / [2,2,2] instead of
+        # [0,1,2]), so instead of cancelling, 3 IDENTICAL masks summed and
+        # then got divided by n_clients=3 -- leaving exactly ONE mask's
+        # worth of residual noise, matching the observed delta norm
+        # exactly. The fix: build a genuinely SEPARATE config dict (and a
+        # new FitIns wrapping it) per client, instead of mutating a shared
+        # reference.
+        out = []
         for client_proxy, fit_ins in fit_ins_list:
-            fit_ins.config["server_round"] = server_round
-            fit_ins.config["client_role"] = self.cid_to_role[client_proxy.cid]
-        return fit_ins_list
+            new_config = dict(fit_ins.config)
+            new_config["server_round"] = server_round
+            new_config["client_role"] = self.cid_to_role[client_proxy.cid]
+            out.append((client_proxy, fl.common.FitIns(fit_ins.parameters, new_config)))
+        return out
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         eval_ins_list = super().configure_evaluate(server_round, parameters, client_manager)
         self._ensure_roles(eval_ins_list)
+        # Same fix as configure_fit above -- independent config per client.
+        out = []
         for client_proxy, eval_ins in eval_ins_list:
-            eval_ins.config["client_role"] = self.cid_to_role[client_proxy.cid]
-        return eval_ins_list
+            new_config = dict(eval_ins.config)
+            new_config["client_role"] = self.cid_to_role[client_proxy.cid]
+            out.append((client_proxy, fl.common.EvaluateIns(eval_ins.parameters, new_config)))
+        return out
 
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
