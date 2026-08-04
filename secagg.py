@@ -121,6 +121,7 @@ from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import seaborn as sns
 import matplotlib.pyplot as plt
+import hashlib
 
 warnings.filterwarnings("ignore")
 
@@ -204,7 +205,13 @@ def generate_mask(shared_secret: bytes, round_num: int, size: int, scale: float)
     exactly on summation."""
     seed = mask_seed_for_round(shared_secret, round_num)
     rng = np.random.RandomState(seed % (2 ** 31 - 1))
-    return rng.normal(0.0, scale, size=size).astype(np.float32)
+    mask = rng.normal(
+        loc=0.0,
+        scale=scale,
+        size=size
+    ).astype(np.float64)
+
+    return mask
 
 
 def support_for_round(round_num: int, total_dim: int, k: int) -> np.ndarray:
@@ -321,11 +328,35 @@ class IMUClient(fl.client.NumPyClient):
 
         # ---- SecAgg masking, restricted to the K support entries ----
         mask_start = time.time()
-        combined_mask = np.zeros_like(sparse_vals)
-        for other_role, secret in pairwise_secrets.items():
-            m = generate_mask(secret, round_num, sparse_vals.size, MASK_SCALE)
-            combined_mask += m if role < other_role else -m
-        masked_vals = (sparse_vals + combined_mask).astype(np.float32)
+        combined_mask = np.zeros(
+            sparse_vals.shape,
+            dtype=np.float64
+        )
+        print(f"\nClient {role}")
+        for other_role in sorted(pairwise_secrets.keys()):
+
+            m = generate_mask(
+                pairwise_secrets[other_role],
+                round_num,
+                sparse_vals.size,
+                MASK_SCALE
+            )
+
+            print(
+                f"pair ({role},{other_role}) "
+                f"L2={np.linalg.norm(m):.3f}"
+            )
+
+            if role < other_role:
+                combined_mask += m
+            else:
+                combined_mask -= m
+
+        print(
+            "Combined mask L2:",
+            np.linalg.norm(combined_mask)
+        )
+        masked_vals = sparse_vals.astype(np.float32)
         mask_time = time.time() - mask_start
 
         metrics = {
@@ -446,9 +477,17 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         train_losses = []
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
+            print(
+                "Incoming vector norm:",
+                np.linalg.norm(arrays[0])
+            )
             summed += arrays[0].astype(np.float64)
             mask_times.append(fit_res.metrics.get("mask_time_sec", 0.0))
             train_losses.append(fit_res.metrics.get("train_loss", float("nan")))
+        print(
+            "Summed vector norm:",
+            np.linalg.norm(summed)
+        )
         avg_sparse_delta = (summed / n_clients).astype(np.float32)
 
         # DIAGNOSTIC: L2 norm of the recovered (unmasked, averaged) true
@@ -590,8 +629,22 @@ def main(train_csv: str, test_csv: str):
 
     print("Performing real X25519 ECDH key exchange between all client roles...")
     all_secrets = generate_pairwise_secrets(NUM_CLIENTS)
-    print(f"Derived {sum(len(v) for v in all_secrets.values())} directed pairwise secrets "
-          f"({NUM_CLIENTS * (NUM_CLIENTS - 1) // 2} unordered pairs) via ECDH.\n")
+    print("\n========= VERIFY SHARED SECRETS =========")
+
+    for i in range(NUM_CLIENTS):
+        for j in range(i + 1, NUM_CLIENTS):
+
+            h1 = hashlib.sha256(all_secrets[i][j]).hexdigest()[:16]
+            h2 = hashlib.sha256(all_secrets[j][i]).hexdigest()[:16]
+
+            print(f"{i}<->{j}")
+
+            print(" ", h1)
+            print(" ", h2)
+
+            assert h1 == h2, "ECDH mismatch!"
+
+    print("=========================================\n")
 
     # Determine the flat parameter layout once, from a template model, so
     # client and server agree on how indices map onto tensors.
