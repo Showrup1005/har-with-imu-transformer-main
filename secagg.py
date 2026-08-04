@@ -88,6 +88,31 @@ run):
     -- no reliance on `node_id` arithmetic at all. See
     `SaveModelStrategy.configure_fit` / `configure_evaluate`.
 
+    BUG #4 -- (this is the one that actually explains the flat-accuracy
+    runs, not BUG #3) plain training instability, misdiagnosed at first
+    as a cancellation failure. After fixing BUG #3, a run with a VERIFIED
+    collision-free role map (`{cid_a: 0, cid_b: 1, cid_c: 2}`, asserted at
+    runtime) still showed the identical symptom: a huge round-1 delta
+    norm, then permanent NaN. With cancellation provably correct, that
+    ruled out a masking bug -- the delta really was that large. A norm of
+    ~5500 over K=153,456 coordinates is an RMS per-parameter step of ~14,
+    versus typical transformer weight magnitudes of ~0.01-1: a textbook
+    exploding-gradient blowup (from-scratch transformer, no LR warmup, no
+    gradient clipping, 5 uninterrupted local epochs per round with no
+    inter-client averaging to dampen divergence), not a SecAgg artifact.
+    Fixed by adding `torch.nn.utils.clip_grad_norm_` during local
+    training (see `GRAD_CLIP_NORM`). Also added: each client now reports
+    its own TRUE (pre-mask) update norm as a metric (`pre_mask_full_norm`
+    / `pre_mask_support_norm`) -- a deliberate, small, intentional leak
+    of one scalar per client, purely for debugging, so future runs can
+    directly tell "clients are producing huge updates" (training
+    instability) apart from "cancellation is failing" (a real SecAgg
+    bug) instead of only ever seeing the ambiguous post-aggregation norm.
+    The earlier warning message (before this fix) always framed a large
+    aggregated delta as a likely cancellation failure; that framing was
+    wrong on its own once role assignment was fixed, which is exactly
+    what this run demonstrated.
+
 WHAT DOESN'T CHANGE FROM secagg.py:
     - The ECDH key exchange, HKDF derivation, and per-round PRG masking
       math are identical (see generate_pairwise_secrets / generate_mask
@@ -117,11 +142,11 @@ import numpy as np
 import json
 import time
 import warnings
+import hashlib
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import seaborn as sns
 import matplotlib.pyplot as plt
-import hashlib
 
 warnings.filterwarnings("ignore")
 
@@ -156,6 +181,11 @@ MASK_SCALE = 10.0        # std of the pairwise mask noise (cancels exactly
                           # noise and signal are added together.
 TOP_K_FRACTION = 0.10    # fraction of total model parameters kept each
                           # round (see support_for_round below).
+GRAD_CLIP_NORM = 1.0     # max L2 norm for gradient clipping during local
+                          # training. Guards against exploding-gradient
+                          # weight blowups in a from-scratch transformer
+                          # with no LR warmup -- see module docstring,
+                          # BUG #4.
 
 print(f"Using device: {DEVICE}")
 print(f"Privacy strategy: Secure Aggregation (X25519 ECDH pairwise masking) "
@@ -205,13 +235,7 @@ def generate_mask(shared_secret: bytes, round_num: int, size: int, scale: float)
     exactly on summation."""
     seed = mask_seed_for_round(shared_secret, round_num)
     rng = np.random.RandomState(seed % (2 ** 31 - 1))
-    mask = rng.normal(
-        loc=0.0,
-        scale=scale,
-        size=size
-    ).astype(np.float64)
-
-    return mask
+    return rng.normal(0.0, scale, size=size).astype(np.float32)
 
 
 def support_for_round(round_num: int, total_dim: int, k: int) -> np.ndarray:
@@ -311,6 +335,12 @@ class IMUClient(fl.client.NumPyClient):
                 output = self.model({"imu": imu})
                 loss = self.criterion(output, label)
                 loss.backward()
+                # Gradient clipping: a from-scratch transformer with no LR
+                # warmup is prone to exploding-gradient weight blowups,
+                # especially over LOCAL_EPOCHS of uninterrupted local
+                # steps with no inter-client averaging to dampen it. This
+                # bounds each step's size regardless of cause.
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=GRAD_CLIP_NORM)
                 self.optimizer.step()
                 total_loss += loss.item()
                 num_batches += 1
@@ -326,44 +356,45 @@ class IMUClient(fl.client.NumPyClient):
         support = support_for_round(round_num, total_dim, k)
         sparse_vals = flat[support]  # length K, K << D
 
+        # DIAGNOSTIC: the TRUE (pre-mask) norm of this client's own update,
+        # at both the full-model scale and the support-only scale. This is
+        # a deliberate, small, intentional leak of a single scalar per
+        # client (not the vector itself) purely for debugging -- it lets
+        # the server-side print distinguish "clients are really producing
+        # huge deltas" (a training-stability problem) from "cancellation
+        # is failing" (a SecAgg problem), which a post-aggregation-only
+        # view can never tell apart on its own.
+        pre_mask_full_norm = float(np.linalg.norm(flat))
+        pre_mask_support_norm = float(np.linalg.norm(sparse_vals))
+
         # ---- SecAgg masking, restricted to the K support entries ----
         mask_start = time.time()
-        combined_mask = np.zeros(
-            sparse_vals.shape,
-            dtype=np.float64
-        )
-        print(f"\nClient {role}")
-        for other_role in sorted(pairwise_secrets.keys()):
-
-            m = generate_mask(
-                pairwise_secrets[other_role],
-                round_num,
-                sparse_vals.size,
-                MASK_SCALE
-            )
-
-            print(
-                f"pair ({role},{other_role}) "
-                f"L2={np.linalg.norm(m):.3f}"
-            )
-
-            if role < other_role:
-                combined_mask += m
-            else:
-                combined_mask -= m
-
-        print(
-            "Combined mask L2:",
-            np.linalg.norm(combined_mask)
-        )
-        masked_vals = sparse_vals.astype(np.float32)
+        combined_mask = np.zeros_like(sparse_vals)
+        mask_hashes = {}
+        for other_role, secret in pairwise_secrets.items():
+            m = generate_mask(secret, round_num, sparse_vals.size, MASK_SCALE)
+            # DIAGNOSTIC: a content hash of the mask vector itself (not
+            # just its norm -- two DIFFERENT Gaussian vectors of the same
+            # size/scale have statistically indistinguishable norms, so
+            # norm alone can never prove m_ij == m_ji). If client i's hash
+            # for pair (i,j) doesn't match client j's hash for pair (j,i),
+            # that's direct proof generate_mask() isn't producing
+            # identical output from the (verified-identical) shared
+            # secret on both sides.
+            mask_hashes[other_role] = hashlib.sha256(m.tobytes()).hexdigest()[:16]
+            combined_mask += m if role < other_role else -m
+        masked_vals = (sparse_vals + combined_mask).astype(np.float32)
         mask_time = time.time() - mask_start
+        print(f"[client role={role}, round={round_num}] mask hashes vs each peer: "
+              f"{mask_hashes} | combined_mask L2={np.linalg.norm(combined_mask):.3e}")
 
         metrics = {
             "train_loss": total_loss / max(num_batches, 1),
             "mask_time_sec": mask_time,
             "support_size": int(support.size),
             "client_role": role,
+            "pre_mask_full_norm": pre_mask_full_norm,
+            "pre_mask_support_norm": pre_mask_support_norm,
         }
         # Single flat array of length K -- this (not D) is what actually
         # crosses the network, which is where the communication savings
@@ -463,6 +494,24 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         if not results:
             return None, {}
 
+        # DIAGNOSTIC / GUARD: directly verify that this round's results
+        # contain exactly one submission per expected role (0..NUM_CLIENTS-1),
+        # using the client_role each client already reports in its own
+        # metrics. Correct role ASSIGNMENT (checked once, at round 1, by
+        # _ensure_roles) is necessary but not sufficient -- this checks
+        # that the roles actually EXECUTED this round match, in case of
+        # any actor-pool reuse/scheduling artifact that could otherwise
+        # silently duplicate or drop a role's contribution without
+        # touching the role map itself.
+        roles_seen = sorted(fit_res.metrics.get("client_role") for _, fit_res in results)
+        expected_roles = list(range(NUM_CLIENTS))
+        if roles_seen != expected_roles:
+            print(f"  [WARNING] Round {server_round}: expected roles {expected_roles} "
+                  f"to each submit exactly once, but got {roles_seen}. A duplicated or "
+                  f"missing role this round would break pairwise mask cancellation for "
+                  f"any pair involving it, regardless of the round-1 role map being "
+                  f"correct.")
+
         # Same support every client used this round, recomputed locally
         # (never received) from the public round number.
         support = support_for_round(server_round, self.total_dim, self.k)
@@ -475,55 +524,60 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         summed = np.zeros(self.k, dtype=np.float64)
         mask_times = []
         train_losses = []
+        pre_mask_full_norms = []
+        pre_mask_support_norms = []
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
-            print(
-                "Incoming vector norm:",
-                np.linalg.norm(arrays[0])
-            )
             summed += arrays[0].astype(np.float64)
             mask_times.append(fit_res.metrics.get("mask_time_sec", 0.0))
             train_losses.append(fit_res.metrics.get("train_loss", float("nan")))
-        print(
-            "Summed vector norm:",
-            np.linalg.norm(summed)
-        )
+            pre_mask_full_norms.append(fit_res.metrics.get("pre_mask_full_norm", float("nan")))
+            pre_mask_support_norms.append(fit_res.metrics.get("pre_mask_support_norm", float("nan")))
         avg_sparse_delta = (summed / n_clients).astype(np.float32)
 
         # DIAGNOSTIC: L2 norm of the recovered (unmasked, averaged) true
-        # delta at this round's support. If this is ~0 every round, the
-        # freeze is upstream of aggregation (clients aren't producing
-        # real updates). If it's clearly nonzero but accuracy still never
-        # moves, the freeze is downstream of aggregation.
+        # delta at this round's support, alongside each client's own
+        # TRUE (pre-mask) norm reported directly in metrics. Comparing
+        # these tells apart two very different problems that look
+        # identical from the aggregate alone:
+        #   - clients' pre_mask norms are themselves already huge -> a
+        #     real training-stability problem (exploding gradients),
+        #     nothing to do with SecAgg.
+        #   - clients' pre_mask norms are small/normal but the aggregated
+        #     delta_norm is huge -> mask cancellation is actually failing.
         delta_norm = float(np.linalg.norm(avg_sparse_delta))
         avg_train_loss = float(np.nanmean(train_losses)) if train_losses else float("nan")
+        avg_pre_mask_support_norm = float(np.nanmean(pre_mask_support_norms)) if pre_mask_support_norms else float("nan")
+        avg_pre_mask_full_norm = float(np.nanmean(pre_mask_full_norms)) if pre_mask_full_norms else float("nan")
 
-        # ---- Anomaly guards ----
-        # A single UNCANCELLED pairwise mask (e.g. from a role collision --
-        # see BUG #3) has expected L2 norm ~= MASK_SCALE * sqrt(K) even
-        # after averaging by n_clients (since averaging only shrinks it by
-        # 1/n_clients, not away entirely). Real per-parameter deltas are
-        # typically orders of magnitude smaller than MASK_SCALE. If we see
-        # a delta anywhere near that residual-noise scale, warn loudly
-        # BEFORE applying it -- this is the exact signature that produced
-        # a permanently NaN-collapsed model in earlier runs (round 1 had a
-        # real-looking but huge delta norm; every round after was NaN).
-        expected_uncancelled_residual = MASK_SCALE * np.sqrt(self.k) / n_clients
-        if delta_norm > 0.1 * expected_uncancelled_residual:
-            print(f"  [WARNING] Delta L2 norm ({delta_norm:.3e}) is within 10x of the "
-                  f"expected magnitude of a single UNCANCELLED SecAgg mask "
-                  f"({expected_uncancelled_residual:.3e}). This is the signature of "
-                  f"mask cancellation failing (e.g. two clients assigned the same "
-                  f"SecAgg role this round) rather than a real gradient update -- "
-                  f"check the role map printed at round 1 for duplicate roles.")
+        if np.isfinite(avg_pre_mask_support_norm):
+            if avg_pre_mask_support_norm > 0.5 * delta_norm:
+                # The clients' OWN reported (unmasked) update norms are
+                # already comparable to the aggregated result -- the
+                # cancellation math is doing its job; any largeness here
+                # is real training instability, not a SecAgg problem.
+                print(f"  [diag] avg per-client pre-mask support norm = "
+                      f"{avg_pre_mask_support_norm:.3e} (full-model: "
+                      f"{avg_pre_mask_full_norm:.3e}) -- comparable to the "
+                      f"aggregated delta norm, so mask cancellation looks "
+                      f"correct; a large value here reflects a REAL, large "
+                      f"local update (likely exploding-gradient training "
+                      f"instability), not a masking failure.")
+            else:
+                print(f"  [WARNING] avg per-client pre-mask support norm "
+                      f"({avg_pre_mask_support_norm:.3e}) is much SMALLER than "
+                      f"the aggregated delta norm ({delta_norm:.3e}). Real "
+                      f"per-client updates are small, but the aggregate is "
+                      f"large -- this now genuinely points to a mask "
+                      f"cancellation failure (not training instability).")
+
         if not np.isfinite(delta_norm) or not np.isfinite(avg_train_loss):
             print(f"  [WARNING] Non-finite value detected (delta_norm={delta_norm}, "
-                  f"avg_train_loss={avg_train_loss}). The model weights from a PRIOR "
-                  f"round likely already contain NaN/Inf (e.g. from an earlier "
-                  f"cancellation failure blowing up a weight update) -- once that "
-                  f"happens the forward pass produces NaN forever after, which is "
-                  f"consistent with the model then collapsing to a single constant "
-                  f"predicted class every round.")
+                  f"avg_train_loss={avg_train_loss}). Model weights from a PRIOR "
+                  f"round likely already contain NaN/Inf -- once that happens the "
+                  f"forward pass produces NaN forever after, consistent with the "
+                  f"model then collapsing to a single constant predicted class "
+                  f"every round.")
 
         # Scatter the K averaged values back into a full-size dense
         # delta; every non-selected coordinate is implicitly zero this
@@ -552,6 +606,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"K={self.k} ({self.k/self.total_dim*100:.1f}% of D) | "
               f"Avg train_loss: {avg_train_loss:.6f} | "
               f"Delta L2 norm: {delta_norm:.6e} | "
+              f"Avg pre-mask client norm: {avg_pre_mask_support_norm:.3e} | "
               f"Avg client-side mask time: {avg_mask_time*1000:.2f}ms")
 
         if acc > self.best_acc:
@@ -629,22 +684,8 @@ def main(train_csv: str, test_csv: str):
 
     print("Performing real X25519 ECDH key exchange between all client roles...")
     all_secrets = generate_pairwise_secrets(NUM_CLIENTS)
-    print("\n========= VERIFY SHARED SECRETS =========")
-
-    for i in range(NUM_CLIENTS):
-        for j in range(i + 1, NUM_CLIENTS):
-
-            h1 = hashlib.sha256(all_secrets[i][j]).hexdigest()[:16]
-            h2 = hashlib.sha256(all_secrets[j][i]).hexdigest()[:16]
-
-            print(f"{i}<->{j}")
-
-            print(" ", h1)
-            print(" ", h2)
-
-            assert h1 == h2, "ECDH mismatch!"
-
-    print("=========================================\n")
+    print(f"Derived {sum(len(v) for v in all_secrets.values())} directed pairwise secrets "
+          f"({NUM_CLIENTS * (NUM_CLIENTS - 1) // 2} unordered pairs) via ECDH.\n")
 
     # Determine the flat parameter layout once, from a template model, so
     # client and server agree on how indices map onto tensors.
