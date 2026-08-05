@@ -12,12 +12,53 @@ The server strategy reverses this before aggregating.
     PRIVACY_QUANT_BITS    -- bits used for stochastic quantization of
                              the transmitted values (8 is a reasonable
                              default; try 4 for a more aggressive test)
+
+OVERHEAD INSTRUMENTATION (NEW):
+    Two kinds of cost are tracked every round, on both sides:
+
+    COMMUNICATION -- three different byte counts are reported per round,
+    because they answer three different questions:
+      - comm_dense_bytes: what ACTUALLY crosses the wire in THIS
+        implementation. The client builds a full D-length array per
+        tensor with (1-keep_ratio) of it zeroed out, and Flower
+        serializes that whole dense array -- so, AS CURRENTLY CODED,
+        SAPM's keep_ratio does NOT reduce bytes transmitted at all
+        versus sending everything. This is worth seeing plainly rather
+        than assuming sparsification implies bandwidth savings.
+      - comm_sparse_encoded_bytes: what a tensor WOULD cost if the
+        nonzero entries were actually sparse-encoded (index + quantized
+        value pairs) instead of sent as a dense array -- i.e. what
+        SAPM's design is presumably meant to achieve, and the fair
+        number to compare against secagg_topk.py's K-length vectors
+        (which really are only K values, not a zero-padded D-length
+        array). This is NOT what this script transmits today; it is
+        reported as the achievable target if sparse-encoding were added.
+      - comm_no_privacy_bytes: a plain dense float32 send of the same
+        tensor (keep_ratio=1.0 equivalent), as a reference baseline for
+        computing a compression ratio.
+
+    COMPUTATION -- wall-clock time added by the privacy mechanism itself,
+    kept separate from ordinary training time:
+      - fisher_time_sec (client): time spent accumulating the per-
+        parameter Fisher (squared-gradient) sensitivity signal across
+        all local steps -- overhead that plain FedAvg training does not
+        pay at all.
+      - transform_time_sec (client): time spent on the post-training
+        top-k masking + quantization + permutation pass.
+      - reconstruct_time_sec (server): time spent on the matching
+        unpermute + dequantize pass across all clients' tensors.
+
+    All of these are printed per round and accumulated into running
+    totals, with a final summary at the last round -- mirroring the
+    mask-timing / delta-norm diagnostics already added to secagg_topk.py,
+    so the two scripts' overhead numbers are directly comparable.
 """
 
 import flwr as fl
 import torch
 import numpy as np
 import json
+import time
 import warnings
 import zlib
 from torch.utils.data import DataLoader, Subset
@@ -110,6 +151,11 @@ USE_PRIVACY = True
 PRIVACY_KEEP_RATIO = 0.3     # fraction of each tensor's elements transmitted
 PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
 
+# ---- overhead-accounting knobs ----
+INDEX_BYTES_PER_ELEMENT = 4  # bytes needed per sparse-encoded index (int32);
+                              # used only for the comm_sparse_encoded_bytes
+                              # estimate, not for the actual bytes sent.
+
 print(f"Using device: {DEVICE}")
 print(f"Privacy strategy: SAPM | enabled={USE_PRIVACY} | keep_ratio={PRIVACY_KEEP_RATIO} | quant_bits={PRIVACY_QUANT_BITS}")
 
@@ -191,6 +237,12 @@ class IMUClient(fl.client.NumPyClient):
             if p.requires_grad
         }
         n_grad_steps = 0
+        fisher_time_sec = 0.0  # wall-clock time spent ONLY on the Fisher
+                                # accumulation itself (the "+= grad**2"
+                                # step below), isolated from the rest of
+                                # each training step so this overhead is
+                                # visible on its own, not blended into
+                                # total_loss/training time.
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -202,9 +254,11 @@ class IMUClient(fl.client.NumPyClient):
                 loss = self.criterion(output, label)
                 loss.backward()
 
+                _fisher_start = time.perf_counter()
                 for name, p in self.model.named_parameters():
                     if p.grad is not None and name in fisher_accum:
                         fisher_accum[name] += p.grad.detach() ** 2
+                fisher_time_sec += time.perf_counter() - _fisher_start
                 n_grad_steps += 1
 
                 self.optimizer.step()
@@ -219,17 +273,27 @@ class IMUClient(fl.client.NumPyClient):
         meta = []
         nz_total, elem_total = 0, 0
 
+        # ---- Overhead accounting (see module docstring) ----
+        comm_dense_bytes = 0          # what THIS script actually sends
+        comm_sparse_encoded_bytes = 0  # what a real sparse encoding would send
+        comm_no_privacy_bytes = 0     # plain dense float32 baseline
+        transform_time_sec = 0.0      # top-k mask + quantize + permute wall time
+
         for name, new_val in new_state.items():
             old_val = old_state[name]
             delta = (new_val - old_val).cpu().numpy()
+            comm_no_privacy_bytes += delta.astype(np.float32).nbytes
 
             if not use_privacy or name not in fisher_accum:
                 out_arrays.append(delta.astype(np.float32))
                 meta.append([1.0, 0.0, False])  # scale, zmin, quantized?
                 nz_total += np.count_nonzero(delta)
                 elem_total += delta.size
+                comm_dense_bytes += delta.astype(np.float32).nbytes
+                comm_sparse_encoded_bytes += delta.astype(np.float32).nbytes
                 continue
 
+            _t0 = time.perf_counter()
             fisher_flat = fisher_accum[name].cpu().numpy().reshape(-1)
             delta_flat = delta.reshape(-1).astype(np.float32)
 
@@ -239,17 +303,33 @@ class IMUClient(fl.client.NumPyClient):
             scale, zmin = pu.compute_quant_params(delta_flat)
             q = pu.quantize_with_params(sparse_delta, scale, zmin, quant_bits)
             permuted = pu.permute_array(q, seed=round_seed * 100003 + deterministic_hash(name) % 97)
+            transform_time_sec += time.perf_counter() - _t0
 
             out_arrays.append(permuted.reshape(delta.shape).astype(np.float32))
             meta.append([float(scale), float(zmin), True])
 
+            nz_count = int(np.count_nonzero(mask))
             nz_total += np.count_nonzero(sparse_delta)
             elem_total += sparse_delta.size
+
+            # AS ACTUALLY SENT: `permuted` is a full D-length float32 array
+            # (zeros included) -- Flower serializes and transmits all of
+            # it, so keep_ratio buys NO reduction in bytes today.
+            comm_dense_bytes += permuted.astype(np.float32).nbytes
+            # AS A SPARSE ENCODING WOULD COST: only the nz_count nonzero
+            # entries, each as (index + quantized value).
+            value_bytes = max(1, -(-quant_bits // 8))  # ceil(bits/8)
+            comm_sparse_encoded_bytes += nz_count * (INDEX_BYTES_PER_ELEMENT + value_bytes)
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
             "nonzero_ratio": float(nz_total / max(1, elem_total)),
             "privacy_meta": json.dumps(meta),
+            "comm_dense_bytes": comm_dense_bytes,
+            "comm_sparse_encoded_bytes": comm_sparse_encoded_bytes,
+            "comm_no_privacy_bytes": comm_no_privacy_bytes,
+            "fisher_time_sec": fisher_time_sec,
+            "transform_time_sec": transform_time_sec,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
 
@@ -286,6 +366,14 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.privacy_keep_ratio = privacy_keep_ratio
         self.privacy_quant_bits = privacy_quant_bits
 
+        # Running totals across the whole run, for the final summary.
+        self.total_comm_dense_bytes = 0
+        self.total_comm_sparse_encoded_bytes = 0
+        self.total_comm_no_privacy_bytes = 0
+        self.total_fisher_time_sec = 0.0
+        self.total_transform_time_sec = 0.0
+        self.total_reconstruct_time_sec = 0.0
+
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
         # Same seed broadcast to every client this round: server (and only
@@ -308,12 +396,27 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         total_examples = 0
         nz_ratios = []
 
+        # ---- Overhead accounting (see module docstring) ----
+        round_comm_dense_bytes = 0
+        round_comm_sparse_encoded_bytes = 0
+        round_comm_no_privacy_bytes = 0
+        round_fisher_time_sec = []
+        round_transform_time_sec = []
+        round_reconstruct_time_sec = 0.0  # server-side unpermute+dequantize
+
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
             num_examples = fit_res.num_examples
             meta = json.loads(fit_res.metrics.get("privacy_meta", "[]"))
             nz_ratios.append(fit_res.metrics.get("nonzero_ratio", 1.0))
 
+            round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
+            round_comm_sparse_encoded_bytes += fit_res.metrics.get("comm_sparse_encoded_bytes", 0)
+            round_comm_no_privacy_bytes += fit_res.metrics.get("comm_no_privacy_bytes", 0)
+            round_fisher_time_sec.append(fit_res.metrics.get("fisher_time_sec", 0.0))
+            round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
+
+            _recon_start = time.perf_counter()
             for i, (k, arr) in enumerate(zip(keys, arrays)):
                 scale, zmin, quantized = meta[i] if i < len(meta) else (1.0, 0.0, False)
                 flat = arr.reshape(-1)
@@ -326,6 +429,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
                     reconstructed = flat
 
                 weighted_deltas[k] += reconstructed.reshape(global_state[k].shape).astype(np.float64) * num_examples
+            round_reconstruct_time_sec += time.perf_counter() - _recon_start
 
             total_examples += num_examples
 
@@ -339,7 +443,29 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         acc = self.evaluate_global(final=False)
         avg_nz = float(np.mean(nz_ratios)) if nz_ratios else 1.0
+
+        # Update running totals.
+        self.total_comm_dense_bytes += round_comm_dense_bytes
+        self.total_comm_sparse_encoded_bytes += round_comm_sparse_encoded_bytes
+        self.total_comm_no_privacy_bytes += round_comm_no_privacy_bytes
+        avg_fisher_time = float(np.mean(round_fisher_time_sec)) if round_fisher_time_sec else 0.0
+        avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
+        self.total_fisher_time_sec += avg_fisher_time
+        self.total_transform_time_sec += avg_transform_time
+        self.total_reconstruct_time_sec += round_reconstruct_time_sec
+
+        compression_vs_no_privacy = (
+            round_comm_sparse_encoded_bytes / round_comm_no_privacy_bytes
+            if round_comm_no_privacy_bytes else 1.0
+        )
         print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | Avg transmitted nonzero ratio: {avg_nz:.3f}")
+        print(f"  [comm] as-sent (dense): {round_comm_dense_bytes/1e6:.3f} MB | "
+              f"sparse-encoded (achievable): {round_comm_sparse_encoded_bytes/1e6:.3f} MB "
+              f"({compression_vs_no_privacy*100:.1f}% of no-privacy baseline) | "
+              f"no-privacy baseline: {round_comm_no_privacy_bytes/1e6:.3f} MB")
+        print(f"  [compute] avg client fisher_time: {avg_fisher_time*1000:.2f}ms | "
+              f"avg client transform_time: {avg_transform_time*1000:.2f}ms | "
+              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
 
         if acc > self.best_acc:
             self.best_acc = acc
@@ -348,8 +474,35 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
+            self.print_overhead_summary()
 
-        return aggregated_params, {"accuracy": acc, "avg_nonzero_ratio": avg_nz}
+        return aggregated_params, {
+            "accuracy": acc,
+            "avg_nonzero_ratio": avg_nz,
+            "comm_dense_bytes": round_comm_dense_bytes,
+            "comm_sparse_encoded_bytes": round_comm_sparse_encoded_bytes,
+        }
+
+    def print_overhead_summary(self):
+        print("\n========== OVERHEAD SUMMARY (SAPM, cumulative over the run) ==========")
+        print(f"Total communication AS ACTUALLY SENT (dense arrays)      : "
+              f"{self.total_comm_dense_bytes/1e6:.2f} MB")
+        print(f"Total communication IF SPARSE-ENCODED (achievable target): "
+              f"{self.total_comm_sparse_encoded_bytes/1e6:.2f} MB")
+        print(f"Total communication with NO privacy (dense, keep_ratio=1): "
+              f"{self.total_comm_no_privacy_bytes/1e6:.2f} MB")
+        if self.total_comm_no_privacy_bytes:
+            print(f"  -> as-sent is {self.total_comm_dense_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
+                  f"of no-privacy baseline (i.e. NO bandwidth savings today -- see module docstring)")
+            print(f"  -> sparse-encoded WOULD BE {self.total_comm_sparse_encoded_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
+                  f"of no-privacy baseline if implemented (this is the number to compare against secagg_topk.py's "
+                  f"real K-length transmissions)")
+        print(f"Total client-side fisher accumulation time (avg client, summed over rounds): "
+              f"{self.total_fisher_time_sec:.2f}s")
+        print(f"Total client-side transform time (mask+quant+permute, avg client, summed)  : "
+              f"{self.total_transform_time_sec:.2f}s")
+        print(f"Total server-side reconstruct time (unpermute+dequantize, summed over rounds): "
+              f"{self.total_reconstruct_time_sec:.2f}s")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
