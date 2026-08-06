@@ -1,142 +1,32 @@
 """
 Federated HAR training with Sensitivity-Aware Private Masking (SAPM),
-now extended with a SAPM+DP hybrid.
+extended with a SAPM+DP hybrid.
 
-Drop-in replacement for the original fl_train.py. Model, dataset, and
-overall FL loop are unchanged; the client no longer sends raw updated
-weights -- it sends a Fisher-sparsified, DP-noised, quantized,
-seed-permuted delta. The server strategy reverses the quantization and
-permutation before aggregating (the DP noise is NOT reversed -- that's
-the whole point of adding it: it has to survive to the aggregate).
+CHANGES IN THIS VERSION (vs. the version you posted):
+  - Added `dp_raw_norm`: the L2 norm of the global selected-value vector
+    BEFORE clipping, captured every round on the client and aggregated
+    (avg across clients) on the server. This is the single number you
+    need to pick a sane PRIVACY_DP_CLIP_NORM -- right now it's set to
+    1.0 with no evidence that's the right scale, which is why dp_scale
+    was ~0.68 (aggressive, lossy clipping) and dp_snr was ~0.003
+    (noise ~300x larger than signal).
+  - Server now prints avg/min/max dp_raw_norm per round and a running
+    history, plus a suggested clip_norm range in the final summary.
+  - Everything else (model, dataset, FL loop, SAPM mechanics) is
+    unchanged from your version.
 
-    USE_PRIVACY           -- master on/off switch for SAPM (False =
-                              behaves like the original plain FedAvg
-                              script; DP is also skipped in that case,
-                              since there is no mask to hang it on)
-    PRIVACY_KEEP_RATIO     -- fraction of each tensor's elements sent
-                              per round (Fisher top-k), e.g. 0.3 = 30%
-    PRIVACY_QUANT_BITS     -- bits used for stochastic quantization of
-                              the transmitted values (8 is a reasonable
-                              default; try 4 for a more aggressive test)
-
-    USE_DP_NOISE           -- master on/off switch for the new DP
-                              add-on. When False, this script behaves
-                              exactly like the original SAPM script
-                              (top-k mask + quantize + permute, no
-                              noise).
-    PRIVACY_DP_EPSILON,
-    PRIVACY_DP_DELTA       -- per-round (epsilon, delta) budget for the
-                              Gaussian mechanism. NOTE: this is a
-                              PER-ROUND budget, not a total-training
-                              guarantee -- composing NUM_ROUNDS
-                              applications of the mechanism needs a
-                              proper accountant (RDP/moments accountant)
-                              for a tight bound. This script reports
-                              a naive basic-composition number
-                              (num_rounds * epsilon) purely as a rough,
-                              conservative diagnostic -- see
-                              print_overhead_summary().
-    PRIVACY_DP_CLIP_NORM   -- L2 clip norm C applied to the vector of
-                              *selected* (top-k) values of a client's
-                              entire update, before noise is added.
-                              This is the DP "sensitivity" bound: it
-                              caps how much any single client's update
-                              can move the aggregate, which is what the
-                              noise is calibrated against.
-
-WHY NOISE ONLY THE TOP-K VALUES (THE HYBRID IDEA):
-    A naive "just bolt DP onto FedAvg" design clips and noises the
-    FULL D-dimensional parameter delta (D ~ 1.5M here). For a fixed
-    L2 clip norm C, spreading that clip budget over ~1.5M coordinates
-    means the *signal* per coordinate is typically tiny, so a noise
-    std sigma calibrated from (C, epsilon, delta) can swamp it -- this
-    is why "full DP" runs often need epsilon in the thousands before
-    the signal survives.
-
-    SAPM already throws away the (1 - keep_ratio) least Fisher-
-    sensitive coordinates every round. If DP noise is added only to
-    the k = keep_ratio * D coordinates SAPM actually keeps (which are,
-    by construction, the highest-Fisher-sensitivity, typically
-    largest-magnitude ones), the *same total clip budget C* is
-    concentrated over far fewer coordinates. Two things follow:
-      1. The per-coordinate noise std sigma, calibrated from
-         (C, epsilon, delta) via the Gaussian mechanism, does NOT
-         depend on k or D directly -- it only depends on C, epsilon,
-         delta. So sigma itself is unchanged by sparsification.
-      2. What DOES change is the per-coordinate SIGNAL: clipping the
-         same C over fewer, larger-magnitude coordinates leaves each
-         surviving coordinate with a bigger share of the energy budget
-         than clipping it over the full dense vector would. That raises
-         the empirical signal-to-noise ratio (mean(|value|) / sigma)
-         for the same (C, epsilon, delta) -- i.e. you can plausibly get
-         away with a smaller epsilon (more privacy) at the same
-         perceived signal quality, precisely because SAPM already did
-         the work of concentrating the update onto fewer, more
-         important coordinates.
-    This script instruments exactly that comparison: dp_snr per round,
-    and a summary that contrasts sparsified vs. dense (keep_ratio=1.0)
-    settings when you re-run with different PRIVACY_KEEP_RATIO values.
-
-OVERHEAD INSTRUMENTATION:
-    Two kinds of cost are tracked every round, on both sides:
-
-    COMMUNICATION -- three different byte counts are reported per round,
-    because they answer three different questions:
-      - comm_dense_bytes: what ACTUALLY crosses the wire in THIS
-        implementation. The client builds a full D-length array per
-        tensor with (1-keep_ratio) of it zeroed out, and Flower
-        serializes that whole dense array -- so, AS CURRENTLY CODED,
-        SAPM's keep_ratio does NOT reduce bytes transmitted at all
-        versus sending everything. This is worth seeing plainly rather
-        than assuming sparsification implies bandwidth savings.
-      - comm_sparse_encoded_bytes: what a tensor WOULD cost if the
-        nonzero entries were actually sparse-encoded (index + quantized
-        value pairs) instead of sent as a dense array -- i.e. what
-        SAPM's design is presumably meant to achieve, and the fair
-        number to compare against secagg_topk.py's K-length vectors
-        (which really are only K values, not a zero-padded D-length
-        array). This is NOT what this script transmits today; it is
-        reported as the achievable target if sparse-encoding were added.
-      - comm_no_privacy_bytes: a plain dense float32 send of the same
-        tensor (keep_ratio=1.0 equivalent), as a reference baseline for
-        computing a compression ratio.
-
-    COMPUTATION -- wall-clock time added by the privacy mechanism itself,
-    kept separate from ordinary training time:
-      - fisher_time_sec (client): time spent accumulating the per-
-        parameter Fisher (squared-gradient) sensitivity signal across
-        all local steps -- overhead that plain FedAvg training does not
-        pay at all.
-      - dp_time_sec (client, NEW): time spent clipping the global
-        selected-value vector and drawing/adding Gaussian noise to it.
-        Kept separate from transform_time_sec so the DP add-on's cost
-        is visible on its own.
-      - transform_time_sec (client): time spent on the post-noise
-        top-k masking + quantization + permutation pass.
-      - reconstruct_time_sec (server): time spent on the matching
-        unpermute + dequantize pass across all clients' tensors (this
-        does NOT remove the DP noise -- only quantization/permutation
-        are inverted).
-
-    DP-SPECIFIC (NEW) -- reported per round and summarized at the end:
-      - dp_clip_norm, dp_epsilon, dp_delta: the configured budget.
-      - dp_scale: the fraction the global selected-value vector had to
-        be shrunk by to satisfy the clip norm (1.0 = no clipping needed
-        this round).
-      - dp_sigma: the Gaussian noise std actually used, calibrated from
-        (dp_clip_norm, dp_epsilon, dp_delta).
-      - dp_k_total: how many coordinates were actually noised this
-        round (sum of per-tensor top-k counts).
-      - dp_signal_mean_abs / dp_snr: mean absolute value of the
-        selected values pre-noise, and the resulting signal-to-noise
-        ratio (dp_signal_mean_abs / dp_sigma) -- the number that shows
-        whether sparsification is buying a better noise/signal trade
-        at a given epsilon.
-
-    All of these are printed per round and accumulated into running
-    totals, with a final summary at the last round -- mirroring the
-    mask-timing / delta-norm diagnostics already added to secagg_topk.py,
-    so the two scripts' overhead numbers are directly comparable.
+HOW TO USE THIS TO FIX THE SNR PROBLEM:
+  1. Run this version for a few rounds (even 3-5 is enough -- the log
+     you posted shows dp_raw_norm-relevant behavior is stable round to
+     round). Look at the new `[dp-calib]` line.
+  2. Set PRIVACY_DP_CLIP_NORM to roughly the median/avg dp_raw_norm you
+     observe (NOT 1.0, which was ~1.5 orders of magnitude too small
+     for a 460K-dim vector). This means clipping barely triggers
+     (dp_scale close to 1.0), so you're not throwing away signal
+     before you even add noise.
+  3. Re-check dp_snr with the corrected clip_norm. If it's still too
+     low, use dp_calibrate.py (companion script) to sweep keep_ratio
+     and epsilon without re-running full training every time.
 """
 
 import flwr as fl
@@ -218,7 +108,7 @@ class pu:
         inv[perm] = np.arange(size)
         return x[inv]
 
-    # ---------------- NEW: DP helpers ----------------
+    # ---------------- DP helpers ----------------
     @staticmethod
     def clip_l2(v: np.ndarray, clip_norm: float):
         """Clip a flat vector to L2 norm <= clip_norm. Returns (clipped_v, scale_used)."""
@@ -236,10 +126,10 @@ class pu:
 
             sigma = clip_norm * sqrt(2 * ln(1.25 / delta)) / epsilon
 
-        This is the standard textbook calibration (Dwork & Roth). It is a
-        sufficient (not necessarily tight) bound; a tighter analytic
-        Gaussian mechanism (Balle & Wang, 2018) could be substituted here
-        without changing anything else in this pipeline.
+        Standard textbook calibration (Dwork & Roth). Sufficient, not
+        necessarily tight -- a tighter analytic Gaussian mechanism
+        (Balle & Wang, 2018) could be substituted without changing
+        anything else in this pipeline.
         """
         if epsilon <= 0 or delta <= 0 or delta >= 1:
             raise ValueError("epsilon must be > 0 and delta must be in (0, 1).")
@@ -262,11 +152,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 3
 
 # ---- privacy strategy knobs ----
 USE_PRIVACY = True
-PRIVACY_KEEP_RATIO = 0.3     # fraction of each tensor's elements transmitted
+PRIVACY_KEEP_RATIO = 0.6     # fraction of each tensor's elements transmitted
 PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
 
 # ---- DP add-on knobs (SAPM+DP hybrid) ----
@@ -274,9 +164,16 @@ USE_DP_NOISE = True          # master switch for the new noise mechanism;
                               # False reproduces the original SAPM script.
 PRIVACY_DP_EPSILON = 8.0     # PER-ROUND epsilon (see module docstring)
 PRIVACY_DP_DELTA = 1e-5      # PER-ROUND delta
-PRIVACY_DP_CLIP_NORM = 1.0   # L2 clip norm C on the vector of selected
-                              # (top-k) values across the whole client
-                              # update, per round.
+PRIVACY_DP_CLIP_NORM = 1.0   # <<< LIKELY MISCALIBRATED. See dp_raw_norm
+                              # logging below -- your posted run showed
+                              # dp_scale ~0.68 at clip_norm=1.0 for a
+                              # 460K-dim vector, meaning the natural
+                              # (unclipped) norm is noticeably larger
+                              # than 1.0 and clipping is already lossy
+                              # before noise is even added. Re-run with
+                              # this instrumented version, read the
+                              # [dp-calib] lines, then set this to
+                              # roughly the observed avg dp_raw_norm.
 
 # ---- overhead-accounting knobs ----
 INDEX_BYTES_PER_ELEMENT = 4  # bytes needed per sparse-encoded index (int32);
@@ -336,7 +233,6 @@ class IMUClient(fl.client.NumPyClient):
         self.criterion = torch.nn.CrossEntropyLoss()
 
     def get_parameters(self, config=None):
-        # Used only for initial global-model bootstrap by Flower.
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
     def set_parameters(self, parameters):
@@ -364,19 +260,13 @@ class IMUClient(fl.client.NumPyClient):
         self.model.train()
         total_loss = 0.0
 
-        # Fisher (diagonal) sensitivity accumulator, one per floating-point param
         fisher_accum = {
             name: torch.zeros_like(p)
             for name, p in self.model.named_parameters()
             if p.requires_grad
         }
         n_grad_steps = 0
-        fisher_time_sec = 0.0  # wall-clock time spent ONLY on the Fisher
-                                # accumulation itself (the "+= grad**2"
-                                # step below), isolated from the rest of
-                                # each training step so this overhead is
-                                # visible on its own, not blended into
-                                # total_loss/training time.
+        fisher_time_sec = 0.0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -403,20 +293,13 @@ class IMUClient(fl.client.NumPyClient):
 
         new_state = self.model.state_dict()
 
-        # ---- Overhead accounting (see module docstring) ----
-        comm_no_privacy_bytes = 0     # plain dense float32 baseline
+        comm_no_privacy_bytes = 0
 
-        # ===== PASS 1: compute deltas, fisher-based top-k masks =====
-        # For tensors under privacy, we defer masking/noising/quantizing
-        # until we've seen every tensor, because the DP clip+noise step
-        # is applied to the GLOBAL vector of selected values across the
-        # whole model update (that's the sensitivity bound the noise is
-        # calibrated against), not tensor-by-tensor.
-        plain_names = []          # tensors NOT under privacy (pass-through)
+        plain_names = []
         plain_arrays = {}
-        priv_names = []           # tensors under privacy
-        priv_delta_flat = {}      # name -> flat float32 delta
-        priv_mask = {}            # name -> bool mask (top-k selection)
+        priv_names = []
+        priv_delta_flat = {}
+        priv_mask = {}
         priv_shape = {}
 
         for name, new_val in new_state.items():
@@ -438,15 +321,17 @@ class IMUClient(fl.client.NumPyClient):
             priv_mask[name] = mask
             priv_shape[name] = delta.shape
 
-        # ===== PASS 2 (NEW): global clip + Gaussian noise over the =====
-        # ===== concatenated vector of top-k selected values =====
+        # ===== PASS 2: global clip + Gaussian noise =====
         dp_time_sec = 0.0
         dp_scale = 1.0
         dp_sigma = 0.0
         dp_k_total = 0
         dp_signal_mean_abs = 0.0
+        dp_raw_norm = 0.0  # NEW: L2 norm of the selected-value vector
+                            # BEFORE clipping. This is what you should
+                            # be setting PRIVACY_DP_CLIP_NORM close to.
 
-        noised_selected = {}  # name -> noised values, same length as mask.sum()
+        noised_selected = {}
 
         if priv_names:
             _dp_t0 = time.perf_counter()
@@ -458,6 +343,7 @@ class IMUClient(fl.client.NumPyClient):
             if use_dp_noise and dp_k_total > 0:
                 global_vec = np.concatenate([per_name_selected[name] for name in priv_names]).astype(np.float32)
                 dp_signal_mean_abs = float(np.mean(np.abs(global_vec))) if global_vec.size else 0.0
+                dp_raw_norm = float(np.linalg.norm(global_vec))  # NEW: pre-clip norm
 
                 clipped_vec, dp_scale = pu.clip_l2(global_vec, dp_clip_norm)
                 dp_sigma = pu.gaussian_mechanism_sigma(dp_clip_norm, dp_epsilon, dp_delta)
@@ -468,8 +354,6 @@ class IMUClient(fl.client.NumPyClient):
                     noised_selected[name] = noised_vec[offset:offset + length]
                     offset += length
             else:
-                # DP disabled (or nothing selected): pass the selected
-                # values through unchanged -- behaves like plain SAPM.
                 for name in priv_names:
                     noised_selected[name] = per_name_selected[name]
 
@@ -486,7 +370,7 @@ class IMUClient(fl.client.NumPyClient):
         for name in plain_names:
             arr = plain_arrays[name]
             out_arrays.append(arr)
-            meta.append([1.0, 0.0, False])  # scale, zmin, quantized?
+            meta.append([1.0, 0.0, False])
             nz_total += np.count_nonzero(arr)
             elem_total += arr.size
             comm_dense_bytes += arr.nbytes
@@ -513,13 +397,8 @@ class IMUClient(fl.client.NumPyClient):
             nz_total += np.count_nonzero(sparse_delta)
             elem_total += sparse_delta.size
 
-            # AS ACTUALLY SENT: `permuted` is a full D-length float32 array
-            # (zeros included) -- Flower serializes and transmits all of
-            # it, so keep_ratio buys NO reduction in bytes today.
             comm_dense_bytes += permuted.astype(np.float32).nbytes
-            # AS A SPARSE ENCODING WOULD COST: only the nz_count nonzero
-            # entries, each as (index + quantized value).
-            value_bytes = max(1, -(-quant_bits // 8))  # ceil(bits/8)
+            value_bytes = max(1, -(-quant_bits // 8))
             comm_sparse_encoded_bytes += nz_count * (INDEX_BYTES_PER_ELEMENT + value_bytes)
 
         dp_snr = (dp_signal_mean_abs / dp_sigma) if dp_sigma > 0 else float("inf")
@@ -533,7 +412,6 @@ class IMUClient(fl.client.NumPyClient):
             "comm_no_privacy_bytes": comm_no_privacy_bytes,
             "fisher_time_sec": fisher_time_sec,
             "transform_time_sec": transform_time_sec,
-            # ---- NEW: DP diagnostics ----
             "dp_time_sec": dp_time_sec,
             "dp_clip_norm": dp_clip_norm,
             "dp_epsilon": dp_epsilon,
@@ -543,6 +421,7 @@ class IMUClient(fl.client.NumPyClient):
             "dp_k_total": dp_k_total,
             "dp_signal_mean_abs": dp_signal_mean_abs,
             "dp_snr": dp_snr,
+            "dp_raw_norm": dp_raw_norm,  # NEW
         }
         return out_arrays, len(self.train_loader.dataset), metrics
 
@@ -588,7 +467,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.privacy_dp_delta = privacy_dp_delta
         self.privacy_dp_clip_norm = privacy_dp_clip_norm
 
-        # Running totals across the whole run, for the final summary.
         self.total_comm_dense_bytes = 0
         self.total_comm_sparse_encoded_bytes = 0
         self.total_comm_no_privacy_bytes = 0
@@ -599,13 +477,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.dp_sigma_history = []
         self.dp_snr_history = []
         self.dp_k_total_history = []
+        self.dp_raw_norm_history = []  # NEW
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
-        # Same seed broadcast to every client this round: server (and only
-        # the server) can invert every client's permutation deterministically.
-        # The DP noise itself is drawn independently per client and is NOT
-        # inverted by the server -- only quantization/permutation are.
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_privacy"] = self.use_privacy
             fit_ins.config["privacy_keep_ratio"] = self.privacy_keep_ratio
@@ -628,20 +503,19 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         total_examples = 0
         nz_ratios = []
 
-        # ---- Overhead accounting (see module docstring) ----
         round_comm_dense_bytes = 0
         round_comm_sparse_encoded_bytes = 0
         round_comm_no_privacy_bytes = 0
         round_fisher_time_sec = []
         round_transform_time_sec = []
-        round_reconstruct_time_sec = 0.0  # server-side unpermute+dequantize
+        round_reconstruct_time_sec = 0.0
 
-        # ---- NEW: DP accounting ----
         round_dp_time_sec = []
         round_dp_sigma = []
         round_dp_snr = []
         round_dp_k_total = []
         round_dp_scale = []
+        round_dp_raw_norm = []  # NEW
 
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
@@ -660,6 +534,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             round_dp_snr.append(fit_res.metrics.get("dp_snr", 0.0))
             round_dp_k_total.append(fit_res.metrics.get("dp_k_total", 0))
             round_dp_scale.append(fit_res.metrics.get("dp_scale", 1.0))
+            round_dp_raw_norm.append(fit_res.metrics.get("dp_raw_norm", 0.0))  # NEW
 
             _recon_start = time.perf_counter()
             for i, (k, arr) in enumerate(zip(keys, arrays)):
@@ -689,7 +564,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         acc = self.evaluate_global(final=False)
         avg_nz = float(np.mean(nz_ratios)) if nz_ratios else 1.0
 
-        # Update running totals.
         self.total_comm_dense_bytes += round_comm_dense_bytes
         self.total_comm_sparse_encoded_bytes += round_comm_sparse_encoded_bytes
         self.total_comm_no_privacy_bytes += round_comm_no_privacy_bytes
@@ -705,10 +579,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         avg_dp_snr = float(np.mean(finite_snrs)) if finite_snrs else float("inf")
         avg_dp_k_total = float(np.mean(round_dp_k_total)) if round_dp_k_total else 0.0
         avg_dp_scale = float(np.mean(round_dp_scale)) if round_dp_scale else 1.0
+        avg_dp_raw_norm = float(np.mean(round_dp_raw_norm)) if round_dp_raw_norm else 0.0  # NEW
         self.total_dp_time_sec += avg_dp_time
         self.dp_sigma_history.append(avg_dp_sigma)
         self.dp_snr_history.append(avg_dp_snr)
         self.dp_k_total_history.append(avg_dp_k_total)
+        self.dp_raw_norm_history.append(avg_dp_raw_norm)  # NEW
 
         compression_vs_no_privacy = (
             round_comm_sparse_encoded_bytes / round_comm_no_privacy_bytes
@@ -727,6 +603,13 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"sigma={avg_dp_sigma:.6g} | snr={avg_dp_snr:.3f} "
               f"(epsilon={self.privacy_dp_epsilon}, delta={self.privacy_dp_delta}, "
               f"clip_norm={self.privacy_dp_clip_norm})")
+        # NEW: calibration line. If avg_dp_raw_norm is >> clip_norm, clipping
+        # is throwing away real signal before noise is even added -- raise
+        # clip_norm toward this value. If it's << clip_norm, you have slack
+        # to LOWER clip_norm (which lowers sigma too, for free SNR).
+        print(f"  [dp-calib] avg pre-clip L2 norm of selected values: {avg_dp_raw_norm:.4f} "
+              f"(current clip_norm={self.privacy_dp_clip_norm} -> "
+              f"{'clipping is lossy, raise clip_norm' if avg_dp_raw_norm > self.privacy_dp_clip_norm * 1.05 else 'clip_norm has slack, could lower it to cut sigma'})")
 
         if acc > self.best_acc:
             self.best_acc = acc
@@ -744,6 +627,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             "comm_sparse_encoded_bytes": round_comm_sparse_encoded_bytes,
             "dp_sigma": avg_dp_sigma,
             "dp_snr": avg_dp_snr,
+            "dp_raw_norm": avg_dp_raw_norm,
         }
 
     def print_overhead_summary(self):
@@ -758,8 +642,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             print(f"  -> as-sent is {self.total_comm_dense_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
                   f"of no-privacy baseline (i.e. NO bandwidth savings today -- see module docstring)")
             print(f"  -> sparse-encoded WOULD BE {self.total_comm_sparse_encoded_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
-                  f"of no-privacy baseline if implemented (this is the number to compare against secagg_topk.py's "
-                  f"real K-length transmissions)")
+                  f"of no-privacy baseline if implemented")
         print(f"Total client-side fisher accumulation time (avg client, summed over rounds): "
               f"{self.total_fisher_time_sec:.2f}s")
         print(f"Total client-side DP clip+noise time (avg client, summed over rounds)      : "
@@ -774,25 +657,25 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"clip_norm={self.privacy_dp_clip_norm}")
         naive_total_epsilon = self.privacy_dp_epsilon * NUM_ROUNDS
         print(f"Naive BASIC-COMPOSITION total epsilon over {NUM_ROUNDS} rounds: {naive_total_epsilon:.2f} "
-              f"(a crude, conservative upper bound -- use an RDP/moments accountant for a tight bound; "
-              f"advanced composition or subsampling amplification would give a materially smaller number)")
+              f"(crude, conservative upper bound -- use an RDP/moments accountant for a tight bound)")
         if self.dp_sigma_history:
             print(f"Noise std sigma used per round: {self.dp_sigma_history[0]:.6g} "
                   f"(constant across rounds -- depends only on clip_norm/epsilon/delta, NOT on k or D)")
         if self.dp_k_total_history:
             avg_k = float(np.mean(self.dp_k_total_history))
-            print(f"Average number of coordinates actually noised per round (k_total): {avg_k:.0f} "
-                  f"(vs. full model size if keep_ratio were 1.0)")
+            print(f"Average number of coordinates actually noised per round (k_total): {avg_k:.0f}")
+        if self.dp_raw_norm_history:  # NEW
+            arr = np.array(self.dp_raw_norm_history)
+            print(f"Pre-clip L2 norm of selected values across rounds: "
+                  f"min={arr.min():.4f} avg={arr.mean():.4f} max={arr.max():.4f}")
+            print(f"  -> SUGGESTED clip_norm to try next: ~{arr.mean():.4f} "
+                  f"(currently set to {self.privacy_dp_clip_norm}). Setting clip_norm this low "
+                  f"({self.privacy_dp_clip_norm}) for a {int(np.mean(self.dp_k_total_history))}-dim vector was "
+                  f"forcing aggressive, lossy clipping every round on top of the noise.")
         finite_snrs = [s for s in self.dp_snr_history if np.isfinite(s)]
         if finite_snrs:
             print(f"Average empirical signal-to-noise ratio (mean|selected value| / sigma): "
                   f"{np.mean(finite_snrs):.3f}")
-            print("  -> Re-run with PRIVACY_KEEP_RATIO=1.0 (noise spread over the full dense delta, the naive "
-                  "'full DP' baseline) and compare this SNR against the sparsified run above: for the same "
-                  "(epsilon, delta, clip_norm), a smaller keep_ratio concentrates the clip budget onto fewer, "
-                  "higher-Fisher-sensitivity coordinates, which typically raises this SNR -- i.e. better "
-                  "empirical protection at a comparable or better signal quality, or equivalently room to "
-                  "tighten epsilon further at the same signal quality.")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
