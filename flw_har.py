@@ -1,19 +1,83 @@
 """
-Federated HAR training with Sensitivity-Aware Private Masking (SAPM).
+Federated HAR training with Sensitivity-Aware Private Masking (SAPM),
+now extended with a SAPM+DP hybrid.
 
 Drop-in replacement for the original fl_train.py. Model, dataset, and
 overall FL loop are unchanged; the client no longer sends raw updated
-weights -- it sends a Fisher-sparsified, quantized, seed-permuted delta.
-The server strategy reverses this before aggregating.
-    USE_PRIVACY          -- master on/off switch (False = behaves like
-                             the original plain FedAvg script)
-    PRIVACY_KEEP_RATIO    -- fraction of each tensor's elements sent
-                             per round (Fisher top-k), e.g. 0.4 = 40%
-    PRIVACY_QUANT_BITS    -- bits used for stochastic quantization of
-                             the transmitted values (8 is a reasonable
-                             default; try 4 for a more aggressive test)
+weights -- it sends a Fisher-sparsified, DP-noised, quantized,
+seed-permuted delta. The server strategy reverses the quantization and
+permutation before aggregating (the DP noise is NOT reversed -- that's
+the whole point of adding it: it has to survive to the aggregate).
 
-OVERHEAD INSTRUMENTATION (NEW):
+    USE_PRIVACY           -- master on/off switch for SAPM (False =
+                              behaves like the original plain FedAvg
+                              script; DP is also skipped in that case,
+                              since there is no mask to hang it on)
+    PRIVACY_KEEP_RATIO     -- fraction of each tensor's elements sent
+                              per round (Fisher top-k), e.g. 0.3 = 30%
+    PRIVACY_QUANT_BITS     -- bits used for stochastic quantization of
+                              the transmitted values (8 is a reasonable
+                              default; try 4 for a more aggressive test)
+
+    USE_DP_NOISE           -- master on/off switch for the new DP
+                              add-on. When False, this script behaves
+                              exactly like the original SAPM script
+                              (top-k mask + quantize + permute, no
+                              noise).
+    PRIVACY_DP_EPSILON,
+    PRIVACY_DP_DELTA       -- per-round (epsilon, delta) budget for the
+                              Gaussian mechanism. NOTE: this is a
+                              PER-ROUND budget, not a total-training
+                              guarantee -- composing NUM_ROUNDS
+                              applications of the mechanism needs a
+                              proper accountant (RDP/moments accountant)
+                              for a tight bound. This script reports
+                              a naive basic-composition number
+                              (num_rounds * epsilon) purely as a rough,
+                              conservative diagnostic -- see
+                              print_overhead_summary().
+    PRIVACY_DP_CLIP_NORM   -- L2 clip norm C applied to the vector of
+                              *selected* (top-k) values of a client's
+                              entire update, before noise is added.
+                              This is the DP "sensitivity" bound: it
+                              caps how much any single client's update
+                              can move the aggregate, which is what the
+                              noise is calibrated against.
+
+WHY NOISE ONLY THE TOP-K VALUES (THE HYBRID IDEA):
+    A naive "just bolt DP onto FedAvg" design clips and noises the
+    FULL D-dimensional parameter delta (D ~ 1.5M here). For a fixed
+    L2 clip norm C, spreading that clip budget over ~1.5M coordinates
+    means the *signal* per coordinate is typically tiny, so a noise
+    std sigma calibrated from (C, epsilon, delta) can swamp it -- this
+    is why "full DP" runs often need epsilon in the thousands before
+    the signal survives.
+
+    SAPM already throws away the (1 - keep_ratio) least Fisher-
+    sensitive coordinates every round. If DP noise is added only to
+    the k = keep_ratio * D coordinates SAPM actually keeps (which are,
+    by construction, the highest-Fisher-sensitivity, typically
+    largest-magnitude ones), the *same total clip budget C* is
+    concentrated over far fewer coordinates. Two things follow:
+      1. The per-coordinate noise std sigma, calibrated from
+         (C, epsilon, delta) via the Gaussian mechanism, does NOT
+         depend on k or D directly -- it only depends on C, epsilon,
+         delta. So sigma itself is unchanged by sparsification.
+      2. What DOES change is the per-coordinate SIGNAL: clipping the
+         same C over fewer, larger-magnitude coordinates leaves each
+         surviving coordinate with a bigger share of the energy budget
+         than clipping it over the full dense vector would. That raises
+         the empirical signal-to-noise ratio (mean(|value|) / sigma)
+         for the same (C, epsilon, delta) -- i.e. you can plausibly get
+         away with a smaller epsilon (more privacy) at the same
+         perceived signal quality, precisely because SAPM already did
+         the work of concentrating the update onto fewer, more
+         important coordinates.
+    This script instruments exactly that comparison: dp_snr per round,
+    and a summary that contrasts sparsified vs. dense (keep_ratio=1.0)
+    settings when you re-run with different PRIVACY_KEEP_RATIO values.
+
+OVERHEAD INSTRUMENTATION:
     Two kinds of cost are tracked every round, on both sides:
 
     COMMUNICATION -- three different byte counts are reported per round,
@@ -43,10 +107,31 @@ OVERHEAD INSTRUMENTATION (NEW):
         parameter Fisher (squared-gradient) sensitivity signal across
         all local steps -- overhead that plain FedAvg training does not
         pay at all.
-      - transform_time_sec (client): time spent on the post-training
+      - dp_time_sec (client, NEW): time spent clipping the global
+        selected-value vector and drawing/adding Gaussian noise to it.
+        Kept separate from transform_time_sec so the DP add-on's cost
+        is visible on its own.
+      - transform_time_sec (client): time spent on the post-noise
         top-k masking + quantization + permutation pass.
       - reconstruct_time_sec (server): time spent on the matching
-        unpermute + dequantize pass across all clients' tensors.
+        unpermute + dequantize pass across all clients' tensors (this
+        does NOT remove the DP noise -- only quantization/permutation
+        are inverted).
+
+    DP-SPECIFIC (NEW) -- reported per round and summarized at the end:
+      - dp_clip_norm, dp_epsilon, dp_delta: the configured budget.
+      - dp_scale: the fraction the global selected-value vector had to
+        be shrunk by to satisfy the clip norm (1.0 = no clipping needed
+        this round).
+      - dp_sigma: the Gaussian noise std actually used, calibrated from
+        (dp_clip_norm, dp_epsilon, dp_delta).
+      - dp_k_total: how many coordinates were actually noised this
+        round (sum of per-tensor top-k counts).
+      - dp_signal_mean_abs / dp_snr: mean absolute value of the
+        selected values pre-noise, and the resulting signal-to-noise
+        ratio (dp_signal_mean_abs / dp_sigma) -- the number that shows
+        whether sparsification is buying a better noise/signal trade
+        at a given epsilon.
 
     All of these are printed per round and accumulated into running
     totals, with a final summary at the last round -- mirroring the
@@ -133,6 +218,39 @@ class pu:
         inv[perm] = np.arange(size)
         return x[inv]
 
+    # ---------------- NEW: DP helpers ----------------
+    @staticmethod
+    def clip_l2(v: np.ndarray, clip_norm: float):
+        """Clip a flat vector to L2 norm <= clip_norm. Returns (clipped_v, scale_used)."""
+        norm = float(np.linalg.norm(v))
+        if norm <= clip_norm or norm == 0.0:
+            return v, 1.0
+        scale = clip_norm / norm
+        return v * scale, scale
+
+    @staticmethod
+    def gaussian_mechanism_sigma(clip_norm: float, epsilon: float, delta: float) -> float:
+        """
+        Classic (epsilon, delta)-DP calibration for the Gaussian mechanism
+        with L2 sensitivity `clip_norm`:
+
+            sigma = clip_norm * sqrt(2 * ln(1.25 / delta)) / epsilon
+
+        This is the standard textbook calibration (Dwork & Roth). It is a
+        sufficient (not necessarily tight) bound; a tighter analytic
+        Gaussian mechanism (Balle & Wang, 2018) could be substituted here
+        without changing anything else in this pipeline.
+        """
+        if epsilon <= 0 or delta <= 0 or delta >= 1:
+            raise ValueError("epsilon must be > 0 and delta must be in (0, 1).")
+        return float(clip_norm * np.sqrt(2.0 * np.log(1.25 / delta)) / epsilon)
+
+    @staticmethod
+    def add_gaussian_noise(v: np.ndarray, sigma: float) -> np.ndarray:
+        if sigma <= 0:
+            return v
+        return v + np.random.normal(loc=0.0, scale=sigma, size=v.shape).astype(v.dtype)
+
 # ====================== CONFIG ======================
 with open('config.json', 'r') as f:
     config = json.load(f)
@@ -151,6 +269,15 @@ USE_PRIVACY = True
 PRIVACY_KEEP_RATIO = 0.3     # fraction of each tensor's elements transmitted
 PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
 
+# ---- DP add-on knobs (SAPM+DP hybrid) ----
+USE_DP_NOISE = True          # master switch for the new noise mechanism;
+                              # False reproduces the original SAPM script.
+PRIVACY_DP_EPSILON = 8.0     # PER-ROUND epsilon (see module docstring)
+PRIVACY_DP_DELTA = 1e-5      # PER-ROUND delta
+PRIVACY_DP_CLIP_NORM = 1.0   # L2 clip norm C on the vector of selected
+                              # (top-k) values across the whole client
+                              # update, per round.
+
 # ---- overhead-accounting knobs ----
 INDEX_BYTES_PER_ELEMENT = 4  # bytes needed per sparse-encoded index (int32);
                               # used only for the comm_sparse_encoded_bytes
@@ -158,6 +285,8 @@ INDEX_BYTES_PER_ELEMENT = 4  # bytes needed per sparse-encoded index (int32);
 
 print(f"Using device: {DEVICE}")
 print(f"Privacy strategy: SAPM | enabled={USE_PRIVACY} | keep_ratio={PRIVACY_KEEP_RATIO} | quant_bits={PRIVACY_QUANT_BITS}")
+print(f"DP add-on: enabled={USE_DP_NOISE} | epsilon(per-round)={PRIVACY_DP_EPSILON} | "
+      f"delta(per-round)={PRIVACY_DP_DELTA} | clip_norm={PRIVACY_DP_CLIP_NORM}")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -227,6 +356,11 @@ class IMUClient(fl.client.NumPyClient):
         quant_bits = fit_config.get("privacy_quant_bits", PRIVACY_QUANT_BITS)
         round_seed = fit_config.get("privacy_seed", 0)
 
+        use_dp_noise = fit_config.get("use_dp_noise", USE_DP_NOISE) and use_privacy
+        dp_epsilon = fit_config.get("privacy_dp_epsilon", PRIVACY_DP_EPSILON)
+        dp_delta = fit_config.get("privacy_dp_delta", PRIVACY_DP_DELTA)
+        dp_clip_norm = fit_config.get("privacy_dp_clip_norm", PRIVACY_DP_CLIP_NORM)
+
         self.model.train()
         total_loss = 0.0
 
@@ -269,15 +403,21 @@ class IMUClient(fl.client.NumPyClient):
 
         new_state = self.model.state_dict()
 
-        out_arrays = []
-        meta = []
-        nz_total, elem_total = 0, 0
-
         # ---- Overhead accounting (see module docstring) ----
-        comm_dense_bytes = 0          # what THIS script actually sends
-        comm_sparse_encoded_bytes = 0  # what a real sparse encoding would send
         comm_no_privacy_bytes = 0     # plain dense float32 baseline
-        transform_time_sec = 0.0      # top-k mask + quantize + permute wall time
+
+        # ===== PASS 1: compute deltas, fisher-based top-k masks =====
+        # For tensors under privacy, we defer masking/noising/quantizing
+        # until we've seen every tensor, because the DP clip+noise step
+        # is applied to the GLOBAL vector of selected values across the
+        # whole model update (that's the sensitivity bound the noise is
+        # calibrated against), not tensor-by-tensor.
+        plain_names = []          # tensors NOT under privacy (pass-through)
+        plain_arrays = {}
+        priv_names = []           # tensors under privacy
+        priv_delta_flat = {}      # name -> flat float32 delta
+        priv_mask = {}            # name -> bool mask (top-k selection)
+        priv_shape = {}
 
         for name, new_val in new_state.items():
             old_val = old_state[name]
@@ -285,27 +425,88 @@ class IMUClient(fl.client.NumPyClient):
             comm_no_privacy_bytes += delta.astype(np.float32).nbytes
 
             if not use_privacy or name not in fisher_accum:
-                out_arrays.append(delta.astype(np.float32))
-                meta.append([1.0, 0.0, False])  # scale, zmin, quantized?
-                nz_total += np.count_nonzero(delta)
-                elem_total += delta.size
-                comm_dense_bytes += delta.astype(np.float32).nbytes
-                comm_sparse_encoded_bytes += delta.astype(np.float32).nbytes
+                plain_names.append(name)
+                plain_arrays[name] = delta.astype(np.float32)
                 continue
 
-            _t0 = time.perf_counter()
             fisher_flat = fisher_accum[name].cpu().numpy().reshape(-1)
             delta_flat = delta.reshape(-1).astype(np.float32)
-
             mask = pu.compute_topk_mask(fisher_flat, keep_ratio)
-            sparse_delta = np.where(mask, delta_flat, 0.0).astype(np.float32)
+
+            priv_names.append(name)
+            priv_delta_flat[name] = delta_flat
+            priv_mask[name] = mask
+            priv_shape[name] = delta.shape
+
+        # ===== PASS 2 (NEW): global clip + Gaussian noise over the =====
+        # ===== concatenated vector of top-k selected values =====
+        dp_time_sec = 0.0
+        dp_scale = 1.0
+        dp_sigma = 0.0
+        dp_k_total = 0
+        dp_signal_mean_abs = 0.0
+
+        noised_selected = {}  # name -> noised values, same length as mask.sum()
+
+        if priv_names:
+            _dp_t0 = time.perf_counter()
+
+            per_name_selected = {name: priv_delta_flat[name][priv_mask[name]] for name in priv_names}
+            lengths = [per_name_selected[name].size for name in priv_names]
+            dp_k_total = int(sum(lengths))
+
+            if use_dp_noise and dp_k_total > 0:
+                global_vec = np.concatenate([per_name_selected[name] for name in priv_names]).astype(np.float32)
+                dp_signal_mean_abs = float(np.mean(np.abs(global_vec))) if global_vec.size else 0.0
+
+                clipped_vec, dp_scale = pu.clip_l2(global_vec, dp_clip_norm)
+                dp_sigma = pu.gaussian_mechanism_sigma(dp_clip_norm, dp_epsilon, dp_delta)
+                noised_vec = pu.add_gaussian_noise(clipped_vec, dp_sigma).astype(np.float32)
+
+                offset = 0
+                for name, length in zip(priv_names, lengths):
+                    noised_selected[name] = noised_vec[offset:offset + length]
+                    offset += length
+            else:
+                # DP disabled (or nothing selected): pass the selected
+                # values through unchanged -- behaves like plain SAPM.
+                for name in priv_names:
+                    noised_selected[name] = per_name_selected[name]
+
+            dp_time_sec = time.perf_counter() - _dp_t0
+
+        # ===== PASS 3: scatter noised values back, quantize, permute =====
+        out_arrays = []
+        meta = []
+        nz_total, elem_total = 0, 0
+        comm_dense_bytes = 0
+        comm_sparse_encoded_bytes = 0
+        transform_time_sec = 0.0
+
+        for name in plain_names:
+            arr = plain_arrays[name]
+            out_arrays.append(arr)
+            meta.append([1.0, 0.0, False])  # scale, zmin, quantized?
+            nz_total += np.count_nonzero(arr)
+            elem_total += arr.size
+            comm_dense_bytes += arr.nbytes
+            comm_sparse_encoded_bytes += arr.nbytes
+
+        for name in priv_names:
+            mask = priv_mask[name]
+            shape = priv_shape[name]
+            delta_flat = priv_delta_flat[name]
+
+            _t0 = time.perf_counter()
+            sparse_delta = np.zeros_like(delta_flat)
+            sparse_delta[mask] = noised_selected[name]
 
             scale, zmin = pu.compute_quant_params(delta_flat)
             q = pu.quantize_with_params(sparse_delta, scale, zmin, quant_bits)
             permuted = pu.permute_array(q, seed=round_seed * 100003 + deterministic_hash(name) % 97)
             transform_time_sec += time.perf_counter() - _t0
 
-            out_arrays.append(permuted.reshape(delta.shape).astype(np.float32))
+            out_arrays.append(permuted.reshape(shape).astype(np.float32))
             meta.append([float(scale), float(zmin), True])
 
             nz_count = int(np.count_nonzero(mask))
@@ -321,6 +522,8 @@ class IMUClient(fl.client.NumPyClient):
             value_bytes = max(1, -(-quant_bits // 8))  # ceil(bits/8)
             comm_sparse_encoded_bytes += nz_count * (INDEX_BYTES_PER_ELEMENT + value_bytes)
 
+        dp_snr = (dp_signal_mean_abs / dp_sigma) if dp_sigma > 0 else float("inf")
+
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
             "nonzero_ratio": float(nz_total / max(1, elem_total)),
@@ -330,6 +533,16 @@ class IMUClient(fl.client.NumPyClient):
             "comm_no_privacy_bytes": comm_no_privacy_bytes,
             "fisher_time_sec": fisher_time_sec,
             "transform_time_sec": transform_time_sec,
+            # ---- NEW: DP diagnostics ----
+            "dp_time_sec": dp_time_sec,
+            "dp_clip_norm": dp_clip_norm,
+            "dp_epsilon": dp_epsilon,
+            "dp_delta": dp_delta,
+            "dp_scale": dp_scale,
+            "dp_sigma": dp_sigma,
+            "dp_k_total": dp_k_total,
+            "dp_signal_mean_abs": dp_signal_mean_abs,
+            "dp_snr": dp_snr,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
 
@@ -357,7 +570,12 @@ class IMUClient(fl.client.NumPyClient):
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, use_privacy=USE_PRIVACY,
                  privacy_keep_ratio=PRIVACY_KEEP_RATIO,
-                 privacy_quant_bits=PRIVACY_QUANT_BITS, **kwargs):
+                 privacy_quant_bits=PRIVACY_QUANT_BITS,
+                 use_dp_noise=USE_DP_NOISE,
+                 privacy_dp_epsilon=PRIVACY_DP_EPSILON,
+                 privacy_dp_delta=PRIVACY_DP_DELTA,
+                 privacy_dp_clip_norm=PRIVACY_DP_CLIP_NORM,
+                 **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
@@ -365,6 +583,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.use_privacy = use_privacy
         self.privacy_keep_ratio = privacy_keep_ratio
         self.privacy_quant_bits = privacy_quant_bits
+        self.use_dp_noise = use_dp_noise
+        self.privacy_dp_epsilon = privacy_dp_epsilon
+        self.privacy_dp_delta = privacy_dp_delta
+        self.privacy_dp_clip_norm = privacy_dp_clip_norm
 
         # Running totals across the whole run, for the final summary.
         self.total_comm_dense_bytes = 0
@@ -373,16 +595,26 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.total_fisher_time_sec = 0.0
         self.total_transform_time_sec = 0.0
         self.total_reconstruct_time_sec = 0.0
+        self.total_dp_time_sec = 0.0
+        self.dp_sigma_history = []
+        self.dp_snr_history = []
+        self.dp_k_total_history = []
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
         # Same seed broadcast to every client this round: server (and only
         # the server) can invert every client's permutation deterministically.
+        # The DP noise itself is drawn independently per client and is NOT
+        # inverted by the server -- only quantization/permutation are.
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_privacy"] = self.use_privacy
             fit_ins.config["privacy_keep_ratio"] = self.privacy_keep_ratio
             fit_ins.config["privacy_quant_bits"] = self.privacy_quant_bits
             fit_ins.config["privacy_seed"] = server_round
+            fit_ins.config["use_dp_noise"] = self.use_dp_noise
+            fit_ins.config["privacy_dp_epsilon"] = self.privacy_dp_epsilon
+            fit_ins.config["privacy_dp_delta"] = self.privacy_dp_delta
+            fit_ins.config["privacy_dp_clip_norm"] = self.privacy_dp_clip_norm
         return fit_ins_list
 
     def aggregate_fit(self, server_round, results, failures):
@@ -404,6 +636,13 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         round_transform_time_sec = []
         round_reconstruct_time_sec = 0.0  # server-side unpermute+dequantize
 
+        # ---- NEW: DP accounting ----
+        round_dp_time_sec = []
+        round_dp_sigma = []
+        round_dp_snr = []
+        round_dp_k_total = []
+        round_dp_scale = []
+
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
             num_examples = fit_res.num_examples
@@ -415,6 +654,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             round_comm_no_privacy_bytes += fit_res.metrics.get("comm_no_privacy_bytes", 0)
             round_fisher_time_sec.append(fit_res.metrics.get("fisher_time_sec", 0.0))
             round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
+
+            round_dp_time_sec.append(fit_res.metrics.get("dp_time_sec", 0.0))
+            round_dp_sigma.append(fit_res.metrics.get("dp_sigma", 0.0))
+            round_dp_snr.append(fit_res.metrics.get("dp_snr", 0.0))
+            round_dp_k_total.append(fit_res.metrics.get("dp_k_total", 0))
+            round_dp_scale.append(fit_res.metrics.get("dp_scale", 1.0))
 
             _recon_start = time.perf_counter()
             for i, (k, arr) in enumerate(zip(keys, arrays)):
@@ -454,6 +699,17 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.total_transform_time_sec += avg_transform_time
         self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
+        avg_dp_time = float(np.mean(round_dp_time_sec)) if round_dp_time_sec else 0.0
+        avg_dp_sigma = float(np.mean(round_dp_sigma)) if round_dp_sigma else 0.0
+        finite_snrs = [s for s in round_dp_snr if np.isfinite(s)]
+        avg_dp_snr = float(np.mean(finite_snrs)) if finite_snrs else float("inf")
+        avg_dp_k_total = float(np.mean(round_dp_k_total)) if round_dp_k_total else 0.0
+        avg_dp_scale = float(np.mean(round_dp_scale)) if round_dp_scale else 1.0
+        self.total_dp_time_sec += avg_dp_time
+        self.dp_sigma_history.append(avg_dp_sigma)
+        self.dp_snr_history.append(avg_dp_snr)
+        self.dp_k_total_history.append(avg_dp_k_total)
+
         compression_vs_no_privacy = (
             round_comm_sparse_encoded_bytes / round_comm_no_privacy_bytes
             if round_comm_no_privacy_bytes else 1.0
@@ -464,8 +720,13 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"({compression_vs_no_privacy*100:.1f}% of no-privacy baseline) | "
               f"no-privacy baseline: {round_comm_no_privacy_bytes/1e6:.3f} MB")
         print(f"  [compute] avg client fisher_time: {avg_fisher_time*1000:.2f}ms | "
+              f"avg client dp_time: {avg_dp_time*1000:.2f}ms | "
               f"avg client transform_time: {avg_transform_time*1000:.2f}ms | "
               f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
+        print(f"  [dp] k_total={avg_dp_k_total:.0f} | clip_scale={avg_dp_scale:.4f} | "
+              f"sigma={avg_dp_sigma:.6g} | snr={avg_dp_snr:.3f} "
+              f"(epsilon={self.privacy_dp_epsilon}, delta={self.privacy_dp_delta}, "
+              f"clip_norm={self.privacy_dp_clip_norm})")
 
         if acc > self.best_acc:
             self.best_acc = acc
@@ -481,6 +742,8 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             "avg_nonzero_ratio": avg_nz,
             "comm_dense_bytes": round_comm_dense_bytes,
             "comm_sparse_encoded_bytes": round_comm_sparse_encoded_bytes,
+            "dp_sigma": avg_dp_sigma,
+            "dp_snr": avg_dp_snr,
         }
 
     def print_overhead_summary(self):
@@ -499,10 +762,37 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
                   f"real K-length transmissions)")
         print(f"Total client-side fisher accumulation time (avg client, summed over rounds): "
               f"{self.total_fisher_time_sec:.2f}s")
+        print(f"Total client-side DP clip+noise time (avg client, summed over rounds)      : "
+              f"{self.total_dp_time_sec:.2f}s")
         print(f"Total client-side transform time (mask+quant+permute, avg client, summed)  : "
               f"{self.total_transform_time_sec:.2f}s")
         print(f"Total server-side reconstruct time (unpermute+dequantize, summed over rounds): "
               f"{self.total_reconstruct_time_sec:.2f}s")
+
+        print("\n---- DP (SAPM+DP hybrid) summary ----")
+        print(f"Per-round budget used: epsilon={self.privacy_dp_epsilon}, delta={self.privacy_dp_delta}, "
+              f"clip_norm={self.privacy_dp_clip_norm}")
+        naive_total_epsilon = self.privacy_dp_epsilon * NUM_ROUNDS
+        print(f"Naive BASIC-COMPOSITION total epsilon over {NUM_ROUNDS} rounds: {naive_total_epsilon:.2f} "
+              f"(a crude, conservative upper bound -- use an RDP/moments accountant for a tight bound; "
+              f"advanced composition or subsampling amplification would give a materially smaller number)")
+        if self.dp_sigma_history:
+            print(f"Noise std sigma used per round: {self.dp_sigma_history[0]:.6g} "
+                  f"(constant across rounds -- depends only on clip_norm/epsilon/delta, NOT on k or D)")
+        if self.dp_k_total_history:
+            avg_k = float(np.mean(self.dp_k_total_history))
+            print(f"Average number of coordinates actually noised per round (k_total): {avg_k:.0f} "
+                  f"(vs. full model size if keep_ratio were 1.0)")
+        finite_snrs = [s for s in self.dp_snr_history if np.isfinite(s)]
+        if finite_snrs:
+            print(f"Average empirical signal-to-noise ratio (mean|selected value| / sigma): "
+                  f"{np.mean(finite_snrs):.3f}")
+            print("  -> Re-run with PRIVACY_KEEP_RATIO=1.0 (noise spread over the full dense delta, the naive "
+                  "'full DP' baseline) and compare this SNR against the sparsified run above: for the same "
+                  "(epsilon, delta, clip_norm), a smaller keep_ratio concentrates the clip budget onto fewer, "
+                  "higher-Fisher-sensitivity coordinates, which typically raises this SNR -- i.e. better "
+                  "empirical protection at a comparable or better signal quality, or equivalently room to "
+                  "tighten epsilon further at the same signal quality.")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
@@ -548,10 +838,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (SAPM)")
+        plt.title("Final Confusion Matrix (SAPM+DP)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_sapm.png")
+        plt.savefig("final_confusion_matrix_sapm_dp.png")
         plt.close()
 
         return accuracy
@@ -580,6 +870,10 @@ def main(train_csv: str, test_csv: str):
         use_privacy=USE_PRIVACY,
         privacy_keep_ratio=PRIVACY_KEEP_RATIO,
         privacy_quant_bits=PRIVACY_QUANT_BITS,
+        use_dp_noise=USE_DP_NOISE,
+        privacy_dp_epsilon=PRIVACY_DP_EPSILON,
+        privacy_dp_delta=PRIVACY_DP_DELTA,
+        privacy_dp_clip_norm=PRIVACY_DP_CLIP_NORM,
     )
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
