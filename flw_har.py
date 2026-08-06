@@ -191,7 +191,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 3
 
 # ---- privacy strategy knobs ----
 USE_PRIVACY = True
@@ -215,7 +215,7 @@ PRIVACY_DP_CLIP_NORM = 1.0   # <<< LIKELY MISCALIBRATED. See dp_raw_norm
                               # roughly the observed avg dp_raw_norm.
 
 # ---- DP clip allocation strategy (NEW) ----
-DP_CLIP_MODE = "per-tensor"       # "global"    -- one proportional L2 rescale
+DP_CLIP_MODE = "global"       # "global"    -- one proportional L2 rescale
                                #                over the whole concatenated
                                #                selected-value vector
                                #                (original behavior).
