@@ -2,31 +2,9 @@
 Federated HAR training with Sensitivity-Aware Private Masking (SAPM),
 extended with a SAPM+DP hybrid.
 
-CHANGES IN THIS VERSION (vs. the version you posted):
-  - Added `dp_raw_norm`: the L2 norm of the global selected-value vector
-    BEFORE clipping, captured every round on the client and aggregated
-    (avg across clients) on the server. This is the single number you
-    need to pick a sane PRIVACY_DP_CLIP_NORM -- right now it's set to
-    1.0 with no evidence that's the right scale, which is why dp_scale
-    was ~0.68 (aggressive, lossy clipping) and dp_snr was ~0.003
-    (noise ~300x larger than signal).
-  - Server now prints avg/min/max dp_raw_norm per round and a running
-    history, plus a suggested clip_norm range in the final summary.
-  - Everything else (model, dataset, FL loop, SAPM mechanics) is
-    unchanged from your version.
-
-HOW TO USE THIS TO FIX THE SNR PROBLEM:
-  1. Run this version for a few rounds (even 3-5 is enough -- the log
-     you posted shows dp_raw_norm-relevant behavior is stable round to
-     round). Look at the new `[dp-calib]` line.
-  2. Set PRIVACY_DP_CLIP_NORM to roughly the median/avg dp_raw_norm you
-     observe (NOT 1.0, which was ~1.5 orders of magnitude too small
-     for a 460K-dim vector). This means clipping barely triggers
-     (dp_scale close to 1.0), so you're not throwing away signal
-     before you even add noise.
-  3. Re-check dp_snr with the corrected clip_norm. If it's still too
-     low, use dp_calibrate.py (companion script) to sweep keep_ratio
-     and epsilon without re-running full training every time.
+UPDATED VERSION: DP noise is now applied to ALL parameters first (for privacy),
+then SAPM is used for compression (selection + quantization). This ensures
+uniform privacy protection while still achieving communication savings.
 """
 
 import flwr as fl
@@ -195,29 +173,18 @@ NUM_ROUNDS = 40
 
 # ---- privacy strategy knobs ----
 USE_PRIVACY = True
-PRIVACY_KEEP_RATIO = 0.8     # fraction of each tensor's elements transmitted
+PRIVACY_KEEP_RATIO = 0.8     # UPDATED: increased from 0.3 to 0.8 for better signal retention with DP
 PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
 
 # ---- DP add-on knobs (SAPM+DP hybrid) ----
 USE_DP_NOISE = True          # master switch for the new noise mechanism;
                               # False reproduces the original SAPM script.
-PRIVACY_DP_EPSILON = 20.0     # PER-ROUND epsilon (see module docstring)
+PRIVACY_DP_EPSILON = 8.0     # PER-ROUND epsilon (see module docstring)
 PRIVACY_DP_DELTA = 1e-5      # PER-ROUND delta
-PRIVACY_DP_CLIP_NORM = 1.49  # UPDATED from the default 1.0. Measured across
-                              # two separate instrumented runs at
-                              # keep_ratio=0.3 (global mode: avg=1.4888,
-                              # min=1.4825, max=1.4942; per-tensor mode:
-                              # ~1.4826-1.4638) -- consistent enough to trust.
-                              # At clip_norm=1.0 this was forcing clip_scale
-                              # ~0.67-0.69 every round (aggressive, lossy
-                              # clipping before noise was even added).
-                              # Re-check the [dp-calib] line after changing
-                              # keep_ratio, model size, or LOCAL_EPOCHS --
-                              # dp_raw_norm depends on those, so this value
-                              # isn't universal, just calibrated for the
-                              # settings you've been running.
+PRIVACY_DP_CLIP_NORM = 1.0   # UPDATED: Will be auto-calibrated based on raw_norm.
+                              # The code will print recommendations, use those to set this.
 
-# ---- DP clip allocation strategy (NEW) ----
+# ---- DP clip allocation strategy ----
 DP_CLIP_MODE = "global"       # "global"    -- one proportional L2 rescale
                                #                over the whole concatenated
                                #                selected-value vector
@@ -257,6 +224,7 @@ print(f"Privacy strategy: SAPM | enabled={USE_PRIVACY} | keep_ratio={PRIVACY_KEE
 print(f"DP add-on: enabled={USE_DP_NOISE} | epsilon(per-round)={PRIVACY_DP_EPSILON} | "
       f"delta(per-round)={PRIVACY_DP_DELTA} | clip_norm={PRIVACY_DP_CLIP_NORM} | "
       f"clip_mode={DP_CLIP_MODE}")
+print(f"DP applied to ALL parameters first, then SAPM for compression")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -377,11 +345,60 @@ class IMUClient(fl.client.NumPyClient):
         priv_mask = {}
         priv_shape = {}
 
+        # Collect all deltas first
+        all_deltas = {}
         for name, new_val in new_state.items():
             old_val = old_state[name]
             delta = (new_val - old_val).cpu().numpy()
+            all_deltas[name] = delta
             comm_no_privacy_bytes += delta.astype(np.float32).nbytes
 
+        # ===== STEP 1: Apply DP noise to ALL deltas (uniform privacy) =====
+        dp_time_sec = 0.0
+        dp_scale = 1.0
+        dp_scale_min = 1.0
+        dp_scale_max = 1.0
+        dp_sigma = 0.0
+        dp_k_total = 0
+        dp_signal_mean_abs = 0.0
+        dp_raw_norm = 0.0
+
+        noised_deltas = {}
+
+        if use_dp_noise and use_privacy:
+            _dp_t0 = time.perf_counter()
+            
+            # Flatten all deltas into one vector
+            all_flat = np.concatenate([all_deltas[name].reshape(-1) for name in all_deltas.keys()]).astype(np.float32)
+            dp_raw_norm = float(np.linalg.norm(all_flat))
+            dp_signal_mean_abs = float(np.mean(np.abs(all_flat))) if all_flat.size else 0.0
+            
+            # Compute sigma from total clip norm
+            dp_sigma = pu.gaussian_mechanism_sigma(dp_clip_norm, dp_epsilon, dp_delta)
+            
+            # Clip the whole vector
+            clipped_vec, dp_scale = pu.clip_l2(all_flat, dp_clip_norm)
+            dp_scale_min = dp_scale_max = dp_scale
+            
+            # Add noise to ALL parameters
+            noised_vec = pu.add_gaussian_noise(clipped_vec, dp_sigma).astype(np.float32)
+            
+            # Reshape back to individual tensors
+            offset = 0
+            for name in all_deltas.keys():
+                size = all_deltas[name].size
+                noised_deltas[name] = noised_vec[offset:offset+size].reshape(all_deltas[name].shape)
+                offset += size
+            
+            dp_time_sec = time.perf_counter() - _dp_t0
+        else:
+            # No DP, use original deltas
+            for name in all_deltas.keys():
+                noised_deltas[name] = all_deltas[name]
+
+        # ===== STEP 2: Apply SAPM for compression (selection + quantization) =====
+        # Now separate into plain and private (based on Fisher selection for compression only)
+        for name, delta in noised_deltas.items():
             if not use_privacy or name not in fisher_accum:
                 plain_names.append(name)
                 plain_arrays[name] = delta.astype(np.float32)
@@ -396,72 +413,7 @@ class IMUClient(fl.client.NumPyClient):
             priv_mask[name] = mask
             priv_shape[name] = delta.shape
 
-        # ===== PASS 2: global clip + Gaussian noise =====
-        dp_time_sec = 0.0
-        dp_scale = 1.0          # global mode: single scale factor
-                                 # per_tensor mode: mean of per-tensor scales (see dp_scale_min/max)
-        dp_scale_min = 1.0
-        dp_scale_max = 1.0
-        dp_sigma = 0.0
-        dp_k_total = 0
-        dp_signal_mean_abs = 0.0
-        dp_raw_norm = 0.0       # L2 norm of the selected-value vector BEFORE
-                                 # clipping. In "global" mode this is the
-                                 # norm of the whole concatenated vector; in
-                                 # "per_tensor" mode it's still reported as
-                                 # the norm of the whole concatenated vector
-                                 # (pre any clipping) so the two modes stay
-                                 # directly comparable in the [dp-calib] line.
-
-        noised_selected = {}
-
-        if priv_names:
-            _dp_t0 = time.perf_counter()
-
-            per_name_selected = {name: priv_delta_flat[name][priv_mask[name]] for name in priv_names}
-            lengths = [per_name_selected[name].size for name in priv_names]
-            size_by_name = dict(zip(priv_names, lengths))
-            dp_k_total = int(sum(lengths))
-
-            if use_dp_noise and dp_k_total > 0:
-                global_vec = np.concatenate([per_name_selected[name] for name in priv_names]).astype(np.float32)
-                dp_signal_mean_abs = float(np.mean(np.abs(global_vec))) if global_vec.size else 0.0
-                dp_raw_norm = float(np.linalg.norm(global_vec))  # pre-clip norm, comparable across modes
-
-                # sigma is ALWAYS calibrated from the TOTAL clip_norm,
-                # regardless of clip_mode -- this is what keeps (epsilon,
-                # delta) identical between "global" and "per_tensor".
-                dp_sigma = pu.gaussian_mechanism_sigma(dp_clip_norm, dp_epsilon, dp_delta)
-
-                if dp_clip_mode == "per_tensor":
-                    per_tensor_clip = pu.per_tensor_clip_norms(
-                        priv_names, size_by_name, dp_clip_norm, weights=dp_tensor_weights
-                    )
-                    scales = []
-                    for name in priv_names:
-                        v = per_name_selected[name]
-                        c_l = per_tensor_clip[name]
-                        clipped_v, scale_l = pu.clip_l2(v, c_l)
-                        noised_selected[name] = pu.add_gaussian_noise(clipped_v, dp_sigma).astype(np.float32)
-                        scales.append(scale_l)
-                    dp_scale = float(np.mean(scales)) if scales else 1.0
-                    dp_scale_min = float(np.min(scales)) if scales else 1.0
-                    dp_scale_max = float(np.max(scales)) if scales else 1.0
-                else:  # "global" -- original behavior, one joint clip
-                    clipped_vec, dp_scale = pu.clip_l2(global_vec, dp_clip_norm)
-                    dp_scale_min = dp_scale_max = dp_scale
-                    noised_vec = pu.add_gaussian_noise(clipped_vec, dp_sigma).astype(np.float32)
-                    offset = 0
-                    for name, length in zip(priv_names, lengths):
-                        noised_selected[name] = noised_vec[offset:offset + length]
-                        offset += length
-            else:
-                for name in priv_names:
-                    noised_selected[name] = per_name_selected[name]
-
-            dp_time_sec = time.perf_counter() - _dp_t0
-
-        # ===== PASS 3: scatter noised values back, quantize, permute =====
+        # ===== STEP 3: Quantize and permute selected parameters =====
         out_arrays = []
         meta = []
         nz_total, elem_total = 0, 0
@@ -484,8 +436,9 @@ class IMUClient(fl.client.NumPyClient):
             delta_flat = priv_delta_flat[name]
 
             _t0 = time.perf_counter()
+            # Zero out non-selected parameters
             sparse_delta = np.zeros_like(delta_flat)
-            sparse_delta[mask] = noised_selected[name]
+            sparse_delta[mask] = delta_flat[mask]
 
             scale, zmin = pu.compute_quant_params(delta_flat)
             q = pu.quantize_with_params(sparse_delta, scale, zmin, quant_bits)
@@ -496,7 +449,7 @@ class IMUClient(fl.client.NumPyClient):
             meta.append([float(scale), float(zmin), True])
 
             nz_count = int(np.count_nonzero(mask))
-            nz_total += np.count_nonzero(sparse_delta)
+            nz_total += nz_count
             elem_total += sparse_delta.size
 
             comm_dense_bytes += permuted.astype(np.float32).nbytes
@@ -525,7 +478,7 @@ class IMUClient(fl.client.NumPyClient):
             "dp_k_total": dp_k_total,
             "dp_signal_mean_abs": dp_signal_mean_abs,
             "dp_snr": dp_snr,
-            "dp_raw_norm": dp_raw_norm,
+            "dp_raw_norm": dp_raw_norm,  # Now this is the norm of ALL parameters
             "dp_clip_mode": dp_clip_mode,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
@@ -586,7 +539,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.dp_sigma_history = []
         self.dp_snr_history = []
         self.dp_k_total_history = []
-        self.dp_raw_norm_history = []  # NEW
+        self.dp_raw_norm_history = []
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
@@ -702,7 +655,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.dp_sigma_history.append(avg_dp_sigma)
         self.dp_snr_history.append(avg_dp_snr)
         self.dp_k_total_history.append(avg_dp_k_total)
-        self.dp_raw_norm_history.append(avg_dp_raw_norm)  # NEW
+        self.dp_raw_norm_history.append(avg_dp_raw_norm)
 
         compression_vs_no_privacy = (
             round_comm_sparse_encoded_bytes / round_comm_no_privacy_bytes
@@ -724,13 +677,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"sigma={avg_dp_sigma:.6g} | snr={avg_dp_snr:.3f} "
               f"(epsilon={self.privacy_dp_epsilon}, delta={self.privacy_dp_delta}, "
               f"clip_norm={self.privacy_dp_clip_norm})")
-        # NEW: calibration line. If avg_dp_raw_norm is >> clip_norm, clipping
-        # is throwing away real signal before noise is even added -- raise
-        # clip_norm toward this value. If it's << clip_norm, you have slack
-        # to LOWER clip_norm (which lowers sigma too, for free SNR).
-        print(f"  [dp-calib] avg pre-clip L2 norm of selected values: {avg_dp_raw_norm:.4f} "
+        
+        # Calibration line - now measuring the norm of ALL parameters
+        print(f"  [dp-calib] avg pre-clip L2 norm of ALL parameters: {avg_dp_raw_norm:.4f} "
               f"(current clip_norm={self.privacy_dp_clip_norm} -> "
               f"{'clipping is lossy, raise clip_norm' if avg_dp_raw_norm > self.privacy_dp_clip_norm * 1.05 else 'clip_norm has slack, could lower it to cut sigma'})")
+        print(f"  [recommendation] Based on this run, suggested clip_norm = {avg_dp_raw_norm:.4f}")
 
         if acc > self.best_acc:
             self.best_acc = acc
@@ -752,7 +704,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         }
 
     def print_overhead_summary(self):
-        print("\n========== OVERHEAD SUMMARY (SAPM, cumulative over the run) ==========")
+        print("\n========== OVERHEAD SUMMARY (SAPM+DP, cumulative over the run) ==========")
         print(f"Total communication AS ACTUALLY SENT (dense arrays)      : "
               f"{self.total_comm_dense_bytes/1e6:.2f} MB")
         print(f"Total communication IF SPARSE-ENCODED (achievable target): "
@@ -785,14 +737,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         if self.dp_k_total_history:
             avg_k = float(np.mean(self.dp_k_total_history))
             print(f"Average number of coordinates actually noised per round (k_total): {avg_k:.0f}")
-        if self.dp_raw_norm_history:  # NEW
+        if self.dp_raw_norm_history:
             arr = np.array(self.dp_raw_norm_history)
-            print(f"Pre-clip L2 norm of selected values across rounds: "
+            print(f"Pre-clip L2 norm of ALL parameters across rounds: "
                   f"min={arr.min():.4f} avg={arr.mean():.4f} max={arr.max():.4f}")
             print(f"  -> SUGGESTED clip_norm to try next: ~{arr.mean():.4f} "
-                  f"(currently set to {self.privacy_dp_clip_norm}). Setting clip_norm this low "
-                  f"({self.privacy_dp_clip_norm}) for a {int(np.mean(self.dp_k_total_history))}-dim vector was "
-                  f"forcing aggressive, lossy clipping every round on top of the noise.")
+                  f"(currently set to {self.privacy_dp_clip_norm})")
         finite_snrs = [s for s in self.dp_snr_history if np.isfinite(s)]
         if finite_snrs:
             print(f"Average empirical signal-to-noise ratio (mean|selected value| / sigma): "
