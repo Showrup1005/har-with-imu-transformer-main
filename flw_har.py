@@ -195,13 +195,13 @@ NUM_ROUNDS = 40
 
 # ---- privacy strategy knobs ----
 USE_PRIVACY = True
-PRIVACY_KEEP_RATIO = 0.6     # fraction of each tensor's elements transmitted
+PRIVACY_KEEP_RATIO = 0.8     # fraction of each tensor's elements transmitted
 PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
 
 # ---- DP add-on knobs (SAPM+DP hybrid) ----
 USE_DP_NOISE = True          # master switch for the new noise mechanism;
                               # False reproduces the original SAPM script.
-PRIVACY_DP_EPSILON = 8.0     # PER-ROUND epsilon (see module docstring)
+PRIVACY_DP_EPSILON = 20.0     # PER-ROUND epsilon (see module docstring)
 PRIVACY_DP_DELTA = 1e-5      # PER-ROUND delta
 PRIVACY_DP_CLIP_NORM = 1.49  # UPDATED from the default 1.0. Measured across
                               # two separate instrumented runs at
