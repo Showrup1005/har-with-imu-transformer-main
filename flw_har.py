@@ -195,7 +195,7 @@ NUM_ROUNDS = 40
 
 # ---- privacy strategy knobs ----
 USE_PRIVACY = True
-PRIVACY_KEEP_RATIO = 0.3     # fraction of each tensor's elements transmitted
+PRIVACY_KEEP_RATIO = 0.6     # fraction of each tensor's elements transmitted
 PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
 
 # ---- DP add-on knobs (SAPM+DP hybrid) ----
