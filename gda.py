@@ -1,34 +1,82 @@
 """
-Gradient-inversion attack harness (v3): empirically measures how hard it
+Gradient-inversion attack harness (v4): empirically measures how hard it
 is to reconstruct a client's raw IMU input window from what the server
 actually receives, sweeping across:
 
-    1. NO PRIVACY     -- raw single local-training-step gradient
-    2. SAPM           -- Fisher-sparsified + quantized + permuted, then
-                         unpermuted/dequantized exactly as aggregate_fit
-                         does, at EACH keep_ratio in SAPM_KEEP_RATIOS
-    3. DP-FEDAVG      -- L2-clipped + Gaussian-noised gradient, at EACH
-                         privacy level in DP_PRIVACY_LEVELS (same presets
-                         as fl_train_dp_strong.py)
-    4. SECAGG + TOP-K -- what secagg_topk.py's server actually ever sees,
-                         at EACH keep_fraction in SECAGG_TOPK_FRACTIONS
-                         (NEW in this version -- see below)
+    1. NO PRIVACY       -- raw single local-training-step gradient
+    2. SAPM             -- Fisher-sparsified + quantized (+ permuted,
+                           unpermuted exactly as aggregate_fit does), at
+                           EACH keep_ratio in SAPM_KEEP_RATIOS
+    3. SAPM+DP HYBRID    -- NEW in this version. Same Fisher top-k
+                           selection as SAPM, but the k SELECTED values
+                           are additionally L2-clipped (globally, across
+                           the whole update) and given calibrated
+                           Gaussian noise BEFORE quantization -- exactly
+                           the SAPM+DP hybrid added to fl_train.py's
+                           client. Swept across the SAME
+                           SAPM_KEEP_RATIOS at a FIXED
+                           (epsilon, delta, clip_norm) budget, so
+                           "sapm_kr{X}" vs "sapm_dp_kr{X}" isolates what
+                           adding noise buys beyond sparsification alone,
+                           and "sapm_dp_kr{X}" across different X
+                           isolates the effect fl_train.py's docstring
+                           predicts: concentrating a FIXED clip budget
+                           onto fewer, higher-Fisher-sensitivity
+                           coordinates should raise the empirical
+                           signal-to-noise ratio (and, if the mechanism
+                           is doing its job, reconstruction MSE) relative
+                           to spreading the same budget over more
+                           coordinates.
+    4. DP-FEDAVG         -- L2-clipped + Gaussian-noised gradient, at EACH
+                           privacy level in DP_PRIVACY_LEVELS (same presets
+                           as fl_train_dp_strong.py). This is the "noise
+                           spread over the full dense gradient" baseline
+                           that SAPM+DP HYBRID is meant to improve on.
+    5. SECAGG + TOP-K   -- what secagg_topk.py's server actually ever sees,
+                           at EACH keep_fraction in SECAGG_TOPK_FRACTIONS
 
 THREAT MODEL: the attacker is the aggregating server (has the model
-weights and, for SAPM/SecAgg, the round-derived seed/support).
+weights and, for SAPM/SAPM+DP/SecAgg, the round-derived seed/support).
 
-WHY SECAGG NEEDS A DIFFERENT KIND OF SCENARIO THAN SAPM/DP:
-    SAPM and DP-FedAvg are both SINGLE-CLIENT transforms: the server
-    receives one (sparsified/quantized, or clipped/noised) gradient per
-    client, so "attack the thing the server received" means attacking
-    one transformed victim gradient -- exactly what this harness already
-    did. SecAgg is fundamentally different: by design, the server NEVER
-    receives any individual client's gradient at all, only the SUM
-    across SECAGG_NUM_CLIENTS clients (with the pairwise masks having
-    cancelled out exactly). There is no single "the server received this
-    for the victim" object to attack -- the closest honest analogue is
-    "the server received this for the victim's ROUND", which is an
-    average over multiple clients.
+WHY SAPM+DP HYBRID IS ITS OWN SCENARIO (NOT JUST "SAPM, but noisier"):
+    The naive way to add DP to SAPM would be to noise the FULL dense
+    gradient (that's scenario 4, DP-FEDAVG) and separately sparsify
+    (that's scenario 2, SAPM) -- treating them as independent add-ons.
+    fl_train.py's hybrid does something structurally different: it
+    clips and noises ONLY the k = keep_ratio * D coordinates SAPM's
+    Fisher mask already decided to keep, using the SAME global clip
+    budget C regardless of k. Two consequences worth testing directly
+    rather than assuming:
+      - The Gaussian mechanism's sigma is calibrated from
+        (clip_norm, epsilon, delta) alone -- NOT from k or D -- so sigma
+        is IDENTICAL across every sapm_dp_kr{X} scenario below (this
+        harness computes and prints it once, per fl_train.py's own
+        instrumentation).
+      - What changes across keep_ratio is how much of the true gradient
+        SIGNAL survives clipping at each of the k coordinates. Fewer,
+        Fisher-important coordinates sharing a fixed L2 budget C
+        generally keep more of their original magnitude than many
+        coordinates would. This harness's per-scenario MSE against the
+        true input is the empirical stand-in for "did that concentration
+        effect actually make reconstruction harder, easier, or a wash" --
+        it is not assumed, it is measured.
+    This version reuses SAPM_KEEP_RATIOS (rather than a separate list) so
+    every sapm_kr{X} has an exact sapm_dp_kr{X} counterpart at the same
+    keep_ratio, and only the clip+noise step differs between them.
+
+WHY SECAGG NEEDS A DIFFERENT KIND OF SCENARIO THAN SAPM/SAPM+DP/DP:
+    SAPM, SAPM+DP, and DP-FedAvg are all SINGLE-CLIENT transforms: the
+    server receives one (sparsified/noised/quantized, or clipped/noised)
+    gradient per client, so "attack the thing the server received" means
+    attacking one transformed victim gradient -- exactly what this
+    harness already did for those three. SecAgg is fundamentally
+    different: by design, the server NEVER receives any individual
+    client's gradient at all, only the SUM across SECAGG_NUM_CLIENTS
+    clients (with the pairwise masks having cancelled out exactly).
+    There is no single "the server received this for the victim" object
+    to attack -- the closest honest analogue is "the server received
+    this for the victim's ROUND", which is an average over multiple
+    clients.
 
     This version adds TWO complementary scenarios per keep_fraction,
     matching secagg_topk.py's two actual layers of defense:
@@ -64,19 +112,21 @@ WHY SECAGG NEEDS A DIFFERENT KIND OF SCENARIO THAN SAPM/DP:
     Neither scenario is "the" SecAgg threat model on its own -- together
     they bracket it: "single_masked" is the worst case if the crypto
     fails, "aggregate" is the best case if the crypto holds perfectly.
-    Comparing both against SAPM/DP (which offer no averaging-across-
-    clients defense at all, only per-client transforms) is the fairest
-    way to see what SecAgg's aggregation actually buys you beyond
-    sparsification alone.
+    Comparing both against SAPM/SAPM+DP/DP (which offer no averaging-
+    across-clients defense at all, only per-client transforms) is the
+    fairest way to see what SecAgg's aggregation actually buys you
+    beyond sparsification (and sparsification+noise) alone.
 
-NEW IN THIS VERSION (carried over from v2):
-- Sweeps several SAPM/DP/SecAgg settings instead of one point each, so
-  you get an actual privacy-vs-reconstruction curve for each mechanism.
+CARRIED OVER FROM EARLIER VERSIONS:
+- Sweeps several SAPM/SAPM+DP/DP/SecAgg settings instead of one point
+  each, so you get an actual privacy-vs-reconstruction curve for each
+  mechanism.
 - PROTECT_FINAL_LAYER: when True, the final classification layer's
   weight+bias are never transmitted at all (for every scenario,
-  including both new SecAgg ones -- their indices are simply excluded
-  from the round's support) -- lets you directly test whether this
-  closes the label-leak side channel.
+  including SAPM+DP and both SecAgg ones -- their indices are simply
+  excluded from the round's support / never enter the clip+noise vector)
+  -- lets you directly test whether this closes the label-leak side
+  channel.
 - Paired Wilcoxon signed-rank test (scenario vs. no_privacy) on MSE,
   since the same victims are used across all scenarios -- gives you a
   p-value instead of an eyeballed mean difference.
@@ -84,26 +134,41 @@ NEW IN THIS VERSION (carried over from v2):
   for your own plots later.
 
 RUNTIME WARNING: this sweeps multiple settings, which multiplies cost.
-With defaults below (NUM_VICTIMS x (1 no-privacy + 3 SAPM + 4 DP + 3*2
-SecAgg) = 14 scenarios x 400 attack iterations), expect this to take
-noticeably longer than v1/v2. Lower NUM_VICTIMS or the sweep lists first
-if you just want a quick smoke test. The SecAgg scenarios additionally
-require computing (SECAGG_NUM_CLIENTS - 1) extra gradients per victim
-(the co-participants) -- cheap relative to the 400-iteration attack
-itself, but not free.
+With defaults below (NUM_VICTIMS x (1 no-privacy + 3 SAPM + 3 SAPM+DP +
+4 DP + 3*2 SecAgg) = 17 scenarios x 400 attack iterations), expect this
+to take noticeably longer than v1-v3. Lower NUM_VICTIMS or the sweep
+lists first if you just want a quick smoke test. The SecAgg scenarios
+additionally require computing (SECAGG_NUM_CLIENTS - 1) extra gradients
+per victim (the co-participants) -- cheap relative to the 400-iteration
+attack itself, but not free.
 
 CAVEATS (same as before -- read before treating results as a formal
 privacy proof): this is an empirical demonstration using a single
 local-training-step gradient against a strong (server) attacker with
 400 optimization iterations; results depend on those choices and should
-be reported as such, not as a formal guarantee. For SecAgg specifically:
-the "aggregate" scenario assumes the mask cancellation itself is
-correct (a real, separately-verified property of secagg_topk.py, not
-re-derived here) -- this script does not re-simulate the ECDH/HKDF/mask
-machinery, it directly constructs the plaintext value that correct
-cancellation is defined to produce, since that machinery's correctness
-is a cryptographic property, not a statistical one this kind of
-empirical attack could usefully test.
+be reported as such, not as a formal guarantee.
+  - For SAPM and SAPM+DP HYBRID specifically: both omit the permutation
+    step present in fl_train.py's real pipeline. Permutation is a fixed,
+    seed-known reordering of the SAME multiset of values -- the server
+    inverts it exactly, so it does not change which values the attacker
+    ultimately sees, only their position before un-permuting. Omitting
+    it here is equivalent for this single-shot reconstruction test, and
+    matches how plain SAPM was already handled in earlier versions of
+    this harness.
+  - For SAPM+DP HYBRID: quantization scale/zero-point are computed from
+    the ORIGINAL (pre-mask, pre-noise) gradient range, exactly mirroring
+    a quirk already present in fl_train.py's client (it calls
+    compute_quant_params on the raw delta, not the noised sparse delta) --
+    reproduced here deliberately for fidelity to what the real pipeline
+    actually transmits, not "fixed" to a more principled quantization
+    scheme the real script doesn't use.
+  - For SecAgg specifically: the "aggregate" scenario assumes the mask
+    cancellation itself is correct (a real, separately-verified property
+    of secagg_topk.py, not re-derived here) -- this script does not
+    re-simulate the ECDH/HKDF/mask machinery, it directly constructs the
+    plaintext value that correct cancellation is defined to produce,
+    since that machinery's correctness is a cryptographic property, not
+    a statistical one this kind of empirical attack could usefully test.
 """
 
 import csv
@@ -162,6 +227,19 @@ MODEL_CHECKPOINT = "best_model.pth"   # None = random init (worst-case); or path
 SAPM_KEEP_RATIOS = [0.1, 0.3, 0.6]
 SAPM_QUANT_BITS = 8
 
+# --- SAPM+DP hybrid sweep (NEW -- mirrors the hybrid added to fl_train.py) ---
+# Reuses SAPM_KEEP_RATIOS so every sapm_kr{X} has a matched sapm_dp_kr{X}
+# at the same keep_ratio; only the clip+noise step differs between them.
+SAPM_DP_QUANT_BITS = SAPM_QUANT_BITS
+SAPM_DP_EPSILON = 8.0     # per-shot epsilon (matches fl_train.py's
+                           # PRIVACY_DP_EPSILON default -- see that
+                           # file's docstring on why this is a per-round,
+                           # not a total-training, budget)
+SAPM_DP_DELTA = 1e-5      # per-shot delta (matches PRIVACY_DP_DELTA)
+SAPM_DP_CLIP_NORM = 1.0   # L2 clip norm on the vector of selected
+                           # (top-k) values across the whole gradient
+                           # (matches PRIVACY_DP_CLIP_NORM)
+
 # --- DP sweep (same presets as fl_train_dp_strong.py) ---
 DP_PRIVACY_LEVELS = ["minimal", "moderate", "strong", "very_strong"]
 DP_MAX_GRAD_NORM = 1.0
@@ -175,25 +253,35 @@ SECAGG_NUM_CLIENTS = 3                     # NUM_CLIENTS in secagg_topk.py --
                                             # updates get averaged together
                                             # before the server ever sees
                                             # anything (the "aggregation"
-                                            # defense SAPM/DP don't have).
+                                            # defense SAPM/SAPM+DP/DP don't
+                                            # have).
 SECAGG_MASK_SCALE = 10.0                   # MASK_SCALE in secagg_topk.py --
                                             # std of the pairwise mask noise
                                             # on a single client's WIRE
                                             # message, before cancellation.
 
 # --- Final-layer protection toggle ---
-PROTECT_FINAL_LAYER = True   # set True to test whether excluding the final
+PROTECT_FINAL_LAYER = False   # set True to test whether excluding the final
                               # layer from transmission closes the label leak
 FINAL_LAYER_KEYS = ["imu_head.4.weight", "imu_head.4.bias"]
 
 # --- Attack optimization ---
 ATTACK_ITERS = 400
 ATTACK_LR = 0.05
-NUM_VICTIMS = 30
+NUM_VICTIMS = 10
 
 
 def gaussian_mechanism_epsilon(noise_multiplier, delta):
     return math.sqrt(2 * math.log(1.25 / delta)) / noise_multiplier
+
+
+def gaussian_mechanism_sigma(clip_norm, epsilon, delta):
+    """Classic (epsilon, delta)-DP calibration for the Gaussian mechanism
+    with L2 sensitivity `clip_norm` -- the exact formula used by
+    fl_train.py's pu.gaussian_mechanism_sigma(), reproduced here so the
+    SAPM+DP HYBRID scenario below noises with the same sigma the real
+    client would."""
+    return float(clip_norm * math.sqrt(2.0 * math.log(1.25 / delta)) / epsilon)
 
 
 # ====================== SAPM TRANSFORM ======================
@@ -247,6 +335,76 @@ def apply_sapm_transform(true_grads, keep_ratio, quant_bits, protect_final_layer
         q = quantize_with_params(sparse, scale, zmin, quant_bits)
         recon = dequantize_with_params(q, scale, zmin, quant_bits)
         out[name] = torch.tensor(recon.reshape(g_np.shape), dtype=g.dtype, device=g.device)
+    return out
+
+
+# ====================== SAPM+DP HYBRID TRANSFORM (NEW) ======================
+def apply_sapm_dp_transform(true_grads, keep_ratio, quant_bits, clip_norm, epsilon, delta, protect_final_layer):
+    """Fisher top-k selection (identical to apply_sapm_transform), then a
+    GLOBAL L2 clip + calibrated Gaussian noise over the concatenated
+    vector of selected values across every non-protected tensor, THEN
+    quantize/dequantize -- the exact three-pass pipeline fl_train.py's
+    IMUClient.fit() runs (minus the permutation step; see module
+    docstring's CAVEATS for why that's fine here).
+
+    The clip and noise happen on ONE global vector spanning all tensors
+    (not per-tensor) because that's what the clip_norm sensitivity bound
+    is defined over in fl_train.py -- it caps how much this client's
+    ENTIRE update can move the aggregate, not each tensor separately.
+    """
+    names = []
+    flats = {}
+    masks = {}
+    shapes = {}
+
+    for name, g in true_grads.items():
+        if protect_final_layer and name in FINAL_LAYER_KEYS:
+            continue
+        g_np = g.cpu().numpy().astype(np.float32)
+        flat = g_np.reshape(-1)
+        fisher_flat = flat ** 2
+        mask = compute_topk_mask(fisher_flat, keep_ratio)
+        names.append(name)
+        flats[name] = flat
+        masks[name] = mask
+        shapes[name] = g_np.shape
+
+    selected_per_name = {n: flats[n][masks[n]] for n in names}
+    lengths = [selected_per_name[n].size for n in names]
+    k_total = int(sum(lengths))
+
+    if k_total > 0:
+        global_vec = np.concatenate([selected_per_name[n] for n in names]).astype(np.float32)
+        norm = float(np.linalg.norm(global_vec))
+        clip_scale = 1.0 if norm <= clip_norm or norm == 0.0 else clip_norm / norm
+        clipped_vec = global_vec * clip_scale
+        sigma = gaussian_mechanism_sigma(clip_norm, epsilon, delta)
+        noised_vec = clipped_vec + np.random.normal(0.0, sigma, size=clipped_vec.shape).astype(np.float32)
+    else:
+        noised_vec = np.zeros(0, dtype=np.float32)
+
+    noised_per_name = {}
+    offset = 0
+    for n, length in zip(names, lengths):
+        noised_per_name[n] = noised_vec[offset:offset + length]
+        offset += length
+
+    out = {}
+    for name, g in true_grads.items():
+        if protect_final_layer and name in FINAL_LAYER_KEYS:
+            out[name] = torch.zeros_like(g)
+            continue
+        flat = flats[name]
+        mask = masks[name]
+        sparse = np.zeros_like(flat)
+        sparse[mask] = noised_per_name[name]
+        # Quant params from the ORIGINAL (pre-mask, pre-noise) range --
+        # matches fl_train.py's pu.compute_quant_params(delta_flat) call,
+        # deliberately not "improved" here (see module CAVEATS).
+        scale, zmin = compute_quant_params(flat)
+        q = quantize_with_params(sparse, scale, zmin, quant_bits)
+        recon = dequantize_with_params(q, scale, zmin, quant_bits)
+        out[name] = torch.tensor(recon.reshape(shapes[name]), dtype=g.dtype, device=g.device)
     return out
 
 
@@ -313,7 +471,7 @@ def apply_secagg_topk_transform(model, true_grads, other_grad_dicts, keep_fracti
     """Builds BOTH SecAgg+Top-K scenario variants for one keep_fraction --
     see the module docstring for what each represents and why two are
     needed (SecAgg has no single "the server received this" object the
-    way SAPM/DP do). Returns (single_masked_dict, aggregate_dict)."""
+    way SAPM/SAPM+DP/DP do). Returns (single_masked_dict, aggregate_dict)."""
     param_names = [n for n, _ in model.named_parameters()]
     victim_flat, shapes = flatten_grad_dict(true_grads, param_names)
     total_dim = victim_flat.size
@@ -426,6 +584,13 @@ def build_scenarios(model, true_grads, dp_noise_multipliers, train_dataset, vict
     scenarios = {"no_privacy": true_grads}
     for kr in SAPM_KEEP_RATIOS:
         scenarios[f"sapm_kr{kr}"] = apply_sapm_transform(true_grads, kr, SAPM_QUANT_BITS, PROTECT_FINAL_LAYER)
+    # SAPM+DP HYBRID: same keep_ratios as plain SAPM, fixed DP budget, so
+    # each sapm_dp_kr{X} has a same-keep_ratio sapm_kr{X} counterpart.
+    for kr in SAPM_KEEP_RATIOS:
+        scenarios[f"sapm_dp_kr{kr}"] = apply_sapm_dp_transform(
+            true_grads, kr, SAPM_DP_QUANT_BITS, SAPM_DP_CLIP_NORM,
+            SAPM_DP_EPSILON, SAPM_DP_DELTA, PROTECT_FINAL_LAYER,
+        )
     for level in DP_PRIVACY_LEVELS:
         scenarios[f"dp_{level}"] = apply_dp_transform(
             true_grads, DP_MAX_GRAD_NORM, dp_noise_multipliers[level], PROTECT_FINAL_LAYER
@@ -513,6 +678,13 @@ def main(train_csv: str):
 
     print(f"Model has {num_params:,} parameters | baseline (minimal) noise_multiplier = {baseline_sigma:.6f}")
     print(f"SAPM keep_ratios to sweep: {SAPM_KEEP_RATIOS} (quant_bits={SAPM_QUANT_BITS})")
+
+    hybrid_sigma = gaussian_mechanism_sigma(SAPM_DP_CLIP_NORM, SAPM_DP_EPSILON, SAPM_DP_DELTA)
+    print(f"SAPM+DP hybrid keep_ratios to sweep: {SAPM_KEEP_RATIOS} (quant_bits={SAPM_DP_QUANT_BITS}, "
+          f"epsilon={SAPM_DP_EPSILON}, delta={SAPM_DP_DELTA}, clip_norm={SAPM_DP_CLIP_NORM})")
+    print(f"  Gaussian mechanism sigma (constant across keep_ratio -- depends only on "
+          f"clip_norm/epsilon/delta, NOT on k or D): {hybrid_sigma:.6f}")
+
     print(f"DP levels to sweep: {DP_PRIVACY_LEVELS}")
     for level in DP_PRIVACY_LEVELS:
         sigma = dp_noise_multipliers[level]
@@ -583,11 +755,16 @@ def main(train_csv: str):
     print("Interpretation: higher MSE = harder to reconstruct = stronger empirical privacy.")
     print("p < 0.05 vs no_privacy means that scenario's MSE is statistically distinguishable from doing nothing "
           "(with only NUM_VICTIMS paired samples -- increase NUM_VICTIMS for a more defensible p-value).")
+    print("For each keep_ratio X: compare 'sapm_kr{X}' against 'sapm_dp_kr{X}' to isolate what the calibrated "
+          "noise adds on top of sparsification alone (same mask, same quantization, only clip+noise differs). "
+          "Then compare 'sapm_dp_kr{X}' ACROSS different X values (all at the same fixed epsilon/delta/clip_norm, "
+          "hence the same sigma) to see whether concentrating that fixed clip budget onto fewer, higher-Fisher "
+          "coordinates measurably changes reconstruction difficulty, as fl_train.py's docstring predicts it should.")
     print("For the two 'secagg_kr{X}_*' rows per keep_fraction: 'single_masked' isolates the masking defense "
           "alone (one client's raw wire message); 'aggregate' isolates the averaging-across-clients defense "
           "alone (the plaintext value correct unmasking legitimately produces). Real secagg_topk.py gets BOTH "
-          "at once -- comparing each to SAPM/DP at the same keep_fraction shows what SecAgg's extra averaging "
-          "step buys you beyond sparsification alone.")
+          "at once -- comparing each to SAPM/SAPM+DP/DP at the same keep_fraction shows what SecAgg's extra "
+          "averaging step buys you beyond sparsification (and sparsification+noise) alone.")
     if not _SCIPY_AVAILABLE:
         print("(Install scipy for the paired significance test: pip install scipy)")
 
