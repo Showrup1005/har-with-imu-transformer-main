@@ -191,7 +191,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 3
+NUM_ROUNDS = 40
 
 # ---- privacy strategy knobs ----
 USE_PRIVACY = True
@@ -203,16 +203,19 @@ USE_DP_NOISE = True          # master switch for the new noise mechanism;
                               # False reproduces the original SAPM script.
 PRIVACY_DP_EPSILON = 8.0     # PER-ROUND epsilon (see module docstring)
 PRIVACY_DP_DELTA = 1e-5      # PER-ROUND delta
-PRIVACY_DP_CLIP_NORM = 1.0   # <<< LIKELY MISCALIBRATED. See dp_raw_norm
-                              # logging below -- your posted run showed
-                              # dp_scale ~0.68 at clip_norm=1.0 for a
-                              # 460K-dim vector, meaning the natural
-                              # (unclipped) norm is noticeably larger
-                              # than 1.0 and clipping is already lossy
-                              # before noise is even added. Re-run with
-                              # this instrumented version, read the
-                              # [dp-calib] lines, then set this to
-                              # roughly the observed avg dp_raw_norm.
+PRIVACY_DP_CLIP_NORM = 1.49  # UPDATED from the default 1.0. Measured across
+                              # two separate instrumented runs at
+                              # keep_ratio=0.3 (global mode: avg=1.4888,
+                              # min=1.4825, max=1.4942; per-tensor mode:
+                              # ~1.4826-1.4638) -- consistent enough to trust.
+                              # At clip_norm=1.0 this was forcing clip_scale
+                              # ~0.67-0.69 every round (aggressive, lossy
+                              # clipping before noise was even added).
+                              # Re-check the [dp-calib] line after changing
+                              # keep_ratio, model size, or LOCAL_EPOCHS --
+                              # dp_raw_norm depends on those, so this value
+                              # isn't universal, just calibrated for the
+                              # settings you've been running.
 
 # ---- DP clip allocation strategy (NEW) ----
 DP_CLIP_MODE = "global"       # "global"    -- one proportional L2 rescale
