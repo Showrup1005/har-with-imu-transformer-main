@@ -28,17 +28,28 @@ WHY NOISE IS ADDED ONCE, TO THE SUM, NOT PER-CLIENT:
   update's noise shrinks roughly as (sigma*C / n_clients). This is the
   main lever for keeping DP noise from swamping the model.
 
-CAVEAT WORTH KNOWING BEFORE YOU TUNE THIS:
-  With NUM_CLIENTS=3, that 1/n_clients dilution is weak -- most DP-FL
-  work assumes hundreds-to-thousands of clients for exactly this reason.
-  If accuracy collapses after enabling DP, the first things to check are
-  (in order): is DP_TARGET_EPSILON too tight for 40 rounds x 3 clients,
-  is DP_CLIP_NORM miscalibrated (see the pre_clip_l2_norm diagnostic
-  printed every round -- it tells you the actual scale of client
-  updates so you can set C sensibly instead of guessing), and only then
-  whether you need to reduce what gets noised (e.g. apply DP only to a
-  subset of layers, or bring back Fisher-based top-k as a pure
-  dimensionality-reduction step -- NOT a privacy step this time).
+CAVEAT WORTH KNOWING BEFORE YOU TUNE THIS (updated after round-2 NaNs on
+the NUM_CLIENTS=3 / NUM_ROUNDS=40 config):
+  The noise-to-signal ratio for this mechanism is roughly
+  (sigma * sqrt(D)) / n_clients, where D is the model's total parameter
+  count. That sqrt(D) term dominates for any real-sized model, and no
+  amount of n_clients dilution among a handful of clients rescues it on
+  its own. Two levers were pulled here to bring the ratio down:
+    1. NUM_CLIENTS raised 3 -> 9 (stronger 1/n_clients dilution). NOTE:
+       this repartitions the same centralized dataset into more slices,
+       it does not add real independent privacy principals -- fine for
+       stress-testing the arithmetic, not a substitute for real
+       additional data owners in a production claim.
+    2. NUM_ROUNDS cut 40 -> 10 with LOCAL_EPOCHS raised 5 -> 20, so total
+       local training work is unchanged but the accountant composes
+       over 4x fewer noisy releases, letting it solve for a much
+       smaller sigma at the same epsilon budget.
+  `dp_preflight_check()` prints the projected ratio before training
+  starts using the model's real D -- read that line first. If it's still
+  high, the next lever (not yet applied here) is protecting fewer
+  parameters with DP -- e.g. only the final classifier head -- rather
+  than the whole model, which directly shrinks D instead of fighting it
+  through n_clients or round count.
 
 Install once: pip install opacus --break-system-packages
 """
@@ -104,9 +115,22 @@ torch.manual_seed(42)
 np.random.seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
-NUM_CLIENTS = 3
-LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_CLIENTS = 9             # up from 3. The 1/n_clients dilution of the
+                             # single noise draw (see docstring) is now
+                             # 3x stronger. NOTE: this repartitions the
+                             # SAME centralized dataset into more slices --
+                             # it does not add real independent data
+                             # owners, so treat it as a stress-test of the
+                             # noise/signal arithmetic, not as adding real
+                             # privacy principals to the guarantee.
+LOCAL_EPOCHS = 20            # up from 5
+NUM_ROUNDS = 10              # down from 40 -- rounds*local_epochs stays
+                             # ~200 either way, so total local training
+                             # work is roughly unchanged. What changes is
+                             # the number of noisy releases the accountant
+                             # has to compose over, which lets it solve
+                             # for a much smaller sigma at the same
+                             # epsilon budget (see printed value below).
 
 # ---- differential privacy knobs ----
 USE_PRIVACY = True
@@ -143,6 +167,38 @@ print(f"Privacy: Gaussian-mechanism DP | enabled={USE_PRIVACY} | "
       f"target_delta={DP_TARGET_DELTA}")
 print(f"[DP] Solved noise_multiplier sigma={DP_NOISE_MULTIPLIER:.4f} for "
       f"{NUM_ROUNDS} rounds at full ({NUM_CLIENTS}/{NUM_CLIENTS}) participation each round.")
+
+
+def dp_preflight_check(model, noise_multiplier, clip_norm, n_clients):
+    """Prints the projected noise-to-signal ratio BEFORE training starts,
+    using the actual parameter count D of the model being trained. This
+    is what silently blew up last run (round-2 NaNs) -- catching it here
+    costs one forward pass through arithmetic instead of two rounds of
+    wasted GPU time.
+
+    Derivation: a single Gaussian noise draw with per-coordinate std
+    sigma*C is added to the summed clipped deltas, then divided by
+    n_clients. Real signal in the average is at most C (the clip norm).
+    Total noise vector magnitude is ~ sigma*C*sqrt(D). So:
+        noise_to_signal ≈ (sigma * sqrt(D)) / n_clients
+    Ratio << 1 is healthy. Ratio >> 1 means noise will dominate the
+    update and training will not converge (or will NaN out, as before).
+    """
+    D = sum(p.numel() for p in model.parameters())
+    ratio = (noise_multiplier * (D ** 0.5)) / max(1, n_clients)
+    print(f"\n[DP preflight] model has D={D:,} parameters | "
+          f"projected noise-to-signal ratio ≈ {ratio:.2f} "
+          f"(sigma={noise_multiplier:.4f}, clients={n_clients})")
+    if ratio > 5:
+        print(f"[DP preflight] WARNING: ratio is high -- expect degraded "
+              f"or non-converging training. Consider fewer rounds, more "
+              f"clients, a larger epsilon budget, or protecting fewer "
+              f"parameters with DP.")
+    else:
+        print(f"[DP preflight] ratio looks survivable, but this is an "
+              f"estimate (assumes worst-case clipping) -- still watch the "
+              f"per-round pre_clip_l2_norm and accuracy once training starts.")
+    return ratio
 
 
 # ====================== DATA ======================
@@ -346,6 +402,21 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             noised_sum = summed_flat
 
         avg_flat = noised_sum / max(1, n_clients)
+
+        if not np.all(np.isfinite(avg_flat)):
+            # Noise (or an upstream NaN already in a client's update)
+            # blew this round up. Applying it would permanently corrupt
+            # the global model for every future round, so skip the
+            # update and keep last round's weights instead of silently
+            # propagating NaN forward.
+            print(f"  [dp] WARNING: round {server_round} produced non-finite "
+                  f"values after noising -- skipping this update, global "
+                  f"model unchanged. Check DP_CLIP_NORM / noise_multiplier.")
+            aggregated_params = ndarrays_to_parameters(
+                [v.cpu().numpy() for v in self.global_model.state_dict().values()]
+            )
+            return aggregated_params, {"accuracy": self.best_acc}
+
         avg_deltas = dpu.unflatten(avg_flat, shapes, sizes)
 
         new_state = {}
@@ -452,6 +523,11 @@ def main(train_csv: str, test_csv: str):
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
+
+    if USE_PRIVACY:
+        _probe_model = IMUTransformerEncoder(config).to(DEVICE)
+        dp_preflight_check(_probe_model, DP_NOISE_MULTIPLIER, DP_CLIP_NORM, NUM_CLIENTS)
+        del _probe_model
 
     def client_fn(context):
         if hasattr(context, "node_id"):
