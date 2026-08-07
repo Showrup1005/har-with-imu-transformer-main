@@ -1,55 +1,105 @@
 """
-Federated HAR training with Sensitivity-Aware Private Masking (SAPM),
-extended with a SAPM+DP hybrid.
+Federated HAR training with Sensitivity-Aware Private Masking (SAPM) + DP,
+simplified for calibration/sweeping.
 
-CHANGES IN THIS VERSION (vs. the version you posted):
-  - Added `dp_raw_norm`: the L2 norm of the global selected-value vector
-    BEFORE clipping, captured every round on the client and aggregated
-    (avg across clients) on the server. This is the single number you
-    need to pick a sane PRIVACY_DP_CLIP_NORM -- right now it's set to
-    1.0 with no evidence that's the right scale, which is why dp_scale
-    was ~0.68 (aggressive, lossy clipping) and dp_snr was ~0.003
-    (noise ~300x larger than signal).
-  - Server now prints avg/min/max dp_raw_norm per round and a running
-    history, plus a suggested clip_norm range in the final summary.
-  - Everything else (model, dataset, FL loop, SAPM mechanics) is
-    unchanged from your version.
+CHANGES IN THIS VERSION (vs. the quantized/permuted version):
 
-HOW TO USE THIS TO FIX THE SNR PROBLEM:
-  1. Run this version for a few rounds (even 3-5 is enough -- the log
-     you posted shows dp_raw_norm-relevant behavior is stable round to
-     round). Look at the new `[dp-calib]` line.
-  2. Set PRIVACY_DP_CLIP_NORM to roughly the median/avg dp_raw_norm you
-     observe (NOT 1.0, which was ~1.5 orders of magnitude too small
-     for a 460K-dim vector). This means clipping barely triggers
-     (dp_scale close to 1.0), so you're not throwing away signal
-     before you even add noise.
-  3. Re-check dp_snr with the corrected clip_norm. If it's still too
-     low, use dp_calibrate.py (companion script) to sweep keep_ratio
-     and epsilon without re-running full training every time.
+  1. QUANTIZATION AND PERMUTATION REMOVED.
+     The previous version noised the selected values, then stochastically
+     quantized them to `quant_bits` and permuted them before sending. Both
+     steps are lossy distortions applied ON TOP of DP noise, and neither is
+     part of the (epsilon, delta) accounting -- so they were pure signal
+     loss with no privacy benefit. They're gone. The client now sends the
+     sparse, clipped, noised delta as a plain dense float32 array. This
+     also means the server-side reconstruct step (which used to unpermute
+     + dequantize) is now just "use the array as-is" -- removed too.
+     NOTE: this also means the sparse-encoding communication savings claim
+     ("as-sent could be X% of baseline if sparse-encoded") no longer has a
+     quantized value size to shrink -- comm_sparse_encoded_bytes now
+     assumes 4-byte float values instead of quant_bits-sized ones. This
+     is expected: you're trading bandwidth (dense sends the full model
+     every round, same as no-privacy) for a cleaner accuracy signal while
+     you calibrate DP. Re-add compression later, after DP is actually
+     usable, not before.
+
+  2. FULL CLI CONFIG for sweeping epsilon x keep_ratio without editing code.
+     See `parse_args()` / the bottom of this file for the flags. Every
+     run also gets a `--tag` so sweep outputs (best model, confusion
+     matrix) don't clobber each other.
+
+  3. DP_CLIP_MODE defaults to "per_tensor" with a classifier-weighted
+     budget (`--classifier_weight`, default 5.0). This gives the
+     classifier head a larger share of the fixed clip_norm budget than a
+     plain sqrt(size)-weighted split would -- same total (epsilon, delta)
+     guarantee as "global" mode, just reallocated. At startup the script
+     prints exactly which tensors matched the "classifier" substring so
+     you can confirm it's actually hitting your model's head before
+     trusting the run. IF THE MATCH LIST IS EMPTY, FIX
+     --classifier_substring BEFORE TRUSTING THIS MODE -- an empty match
+     means every tensor silently falls back to weight 1.0 and you're
+     running the sqrt(size)-ish default, not the weighted intent.
+
+  4. Output array ordering fix: arrays are now placed back into
+     model-state-dict key order explicitly (`{name: array}` dict, then
+     re-ordered by `state_dict.keys()`) rather than relying on the
+     accidental ordering of "plain tensors first, then private tensors."
+     That accidental ordering happens to be correct only when the model
+     has zero non-trainable buffers (e.g. no BatchNorm running stats)
+     interleaved between trainable params in the state_dict. It's cheap
+     to make this robust instead of assuming it, so it's fixed here.
+
+WHAT THIS VERSION DOES NOT FIX BY ITSELF:
+  The core SNR problem is dimensionality, not epsilon. In the logged runs:
+    - keep_ratio=0.6, epsilon=8,  clip_norm=1.49 (lossy) -> snr ~ 0.003
+    - keep_ratio=0.3, epsilon=40, clip_norm=1.49 (slack)  -> snr ~ 0.007-0.009
+  A 5x epsilon increase (which cuts sigma 5x) barely moved SNR, because
+  halving keep_ratio also roughly halved k_total (920K -> 460K), and
+  per-coordinate signal scales like raw_norm/sqrt(k) -- so the dominant
+  lever is k (via keep_ratio), not epsilon alone. Use the sweep below to
+  find out how much lower keep_ratio needs to go; don't assume epsilon
+  alone will get you to a usable SNR.
+
+HOW TO SWEEP (bash, from repo root):
+    for eps in 8 20 40; do
+      for kr in 0.6 0.3 0.1 0.05; do
+        python sapm_dp_train.py \
+          --epsilon $eps --keep_ratio $kr \
+          --clip_norm 1.2 \
+          --num_rounds 5 \
+          --tag "eps${eps}_kr${kr}"
+      done
+    done
+  Run short (--num_rounds 5) first to read the `[dp-calib]` and `snr`
+  lines cheaply, THEN commit to a full --num_rounds 40 run for the
+  config that looks best. Re-check clip_norm calibration whenever you
+  change keep_ratio -- raw_norm depends on it.
 """
 
-import flwr as fl
-import torch
-import numpy as np
+import argparse
 import json
 import time
 import warnings
-import zlib
-from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-import seaborn as sns
+
+import flwr as fl
 import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+import torch
+from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from torch.utils.data import DataLoader, Subset
 
 warnings.filterwarnings("ignore")
 
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
-from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
-
-
-def deterministic_hash(name: str) -> int:
-    return zlib.crc32(name.encode("utf-8"))
 
 
 # ====================== PRIVACY (SAPM) HELPERS ======================
@@ -64,49 +114,6 @@ class pu:
         mask = np.zeros(n, dtype=bool)
         mask[idx] = True
         return mask
-
-    @staticmethod
-    def compute_quant_params(x: np.ndarray):
-        x_min, x_max = float(x.min()), float(x.max())
-        if x_max == x_min:
-            return 1.0, x_min
-        return x_max - x_min, x_min
-
-    @staticmethod
-    def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int = 8) -> np.ndarray:
-        if num_bits >= 32:
-            return x.astype(np.float32)
-        qmax = 2 ** num_bits - 1
-        step = scale / qmax if scale != 0 else 1.0
-        x_scaled = (x - zmin) / step
-        floor = np.floor(x_scaled)
-        prob = np.clip(x_scaled - floor, 0.0, 1.0)
-        rnd = np.random.rand(*x.shape)
-        x_q = floor + (rnd < prob)
-        x_q = np.clip(x_q, 0, qmax)
-        return x_q.astype(np.float32)
-
-    @staticmethod
-    def dequantize_with_params(x_q: np.ndarray, scale: float, zmin: float, num_bits: int = 8) -> np.ndarray:
-        if num_bits >= 32:
-            return x_q
-        qmax = 2 ** num_bits - 1
-        step = scale / qmax if scale != 0 else 1.0
-        return x_q * step + zmin
-
-    @staticmethod
-    def permute_array(x: np.ndarray, seed: int):
-        rng = np.random.RandomState(seed % (2 ** 31 - 1))
-        perm = rng.permutation(x.size)
-        return x[perm]
-
-    @staticmethod
-    def unpermute_array(x: np.ndarray, seed: int, size: int):
-        rng = np.random.RandomState(seed % (2 ** 31 - 1))
-        perm = rng.permutation(size)
-        inv = np.empty_like(perm)
-        inv[perm] = np.arange(size)
-        return x[inv]
 
     # ---------------- DP helpers ----------------
     @staticmethod
@@ -149,30 +156,33 @@ class pu:
 
             sqrt(sum_l C_l^2) == total_clip_norm
 
-        This is the property that keeps the PRIVACY GUARANTEE IDENTICAL to
-        clipping the whole concatenated vector at `total_clip_norm`: if each
-        tensor's selected-value vector v_l is independently clipped to
+        This keeps the PRIVACY GUARANTEE IDENTICAL to clipping the whole
+        concatenated vector at `total_clip_norm`: if each tensor's
+        selected-value vector v_l is independently clipped to
         ||v_l|| <= C_l, then the full vector v = (v_1, ..., v_L) satisfies
         ||v||^2 = sum ||v_l||^2 <= sum C_l^2 = total_clip_norm^2, i.e. the
         same L2 sensitivity bound as before. Adding the SAME sigma
-        (calibrated from total_clip_norm, epsilon, delta -- see
-        gaussian_mechanism_sigma) independently to each tensor is then
-        exactly the multivariate Gaussian mechanism over the full vector.
-        Nothing about (epsilon, delta) changes -- only which coordinates
-        get more/less of the fixed clip budget.
+        (calibrated from total_clip_norm, epsilon, delta) independently to
+        each tensor is then exactly the multivariate Gaussian mechanism
+        over the full vector. Nothing about (epsilon, delta) changes --
+        only which coordinates get more/less of the fixed clip budget.
 
-        weights: optional dict {tensor_name: weight}. Larger weight => more
-        of the clip budget. Tensors not in the dict default to weight 1.0.
-        If None, weight defaults to sqrt(size) for every tensor, which
-        approximates what the single joint clip already does under a
-        roughly-uniform-magnitude assumption (a safe, "close to global"
-        starting point -- the real experiment is overriding specific
-        tensor names with larger/smaller weights).
+        weights: optional dict {tensor_name_substring: weight}. A tensor's
+        weight is `weights[s]` for the FIRST substring `s` in `weights`
+        that appears in the tensor's name; tensors matching no substring
+        default to weight 1.0. If `weights` is None, weight defaults to
+        sqrt(size) for every tensor (close to what "global" mode does
+        under a roughly-uniform-magnitude assumption).
         """
         if weights is None:
             shares = np.array([np.sqrt(max(1, size_by_name[n])) for n in names], dtype=np.float64)
         else:
-            shares = np.array([float(weights.get(n, 1.0)) for n in names], dtype=np.float64)
+            def weight_for(name):
+                for substr, w in weights.items():
+                    if substr in name:
+                        return float(w)
+                return 1.0
+            shares = np.array([weight_for(n) for n in names], dtype=np.float64)
         norm = np.sqrt(np.sum(shares ** 2))
         if norm == 0:
             shares = np.ones(len(names), dtype=np.float64)
@@ -180,8 +190,54 @@ class pu:
         shares = shares / norm  # now sqrt(sum(shares^2)) == 1
         return {n: float(total_clip_norm * s) for n, s in zip(names, shares)}
 
-# ====================== CONFIG ======================
-with open('config.json', 'r') as f:
+
+# ====================== CLI CONFIG ======================
+def parse_args():
+    p = argparse.ArgumentParser(description="SAPM+DP federated HAR training (calibration build)")
+    p.add_argument("--train_csv", type=str, default="train.csv")
+    p.add_argument("--test_csv", type=str, default="test.csv")
+    p.add_argument("--num_clients", type=int, default=3)
+    p.add_argument("--local_epochs", type=int, default=5)
+    p.add_argument("--num_rounds", type=int, default=40)
+
+    p.add_argument("--use_privacy", action="store_true", default=True)
+    p.add_argument("--no_privacy", dest="use_privacy", action="store_false")
+    p.add_argument("--keep_ratio", type=float, default=0.3,
+                    help="Fraction of each tensor's elements selected by Fisher top-k.")
+
+    p.add_argument("--use_dp_noise", action="store_true", default=True)
+    p.add_argument("--no_dp_noise", dest="use_dp_noise", action="store_false")
+    p.add_argument("--epsilon", type=float, default=40.0, help="Per-round epsilon.")
+    p.add_argument("--delta", type=float, default=1e-5, help="Per-round delta.")
+    p.add_argument("--clip_norm", type=float, default=1.2,
+                    help="L2 clip budget over the selected-value vector. RECALIBRATE this "
+                         "whenever you change keep_ratio -- watch the [dp-calib] line and "
+                         "set this to the reported avg pre-clip L2 norm.")
+    p.add_argument("--clip_mode", type=str, default="per_tensor", choices=["global", "per_tensor"])
+    p.add_argument("--classifier_weight", type=float, default=5.0,
+                    help="Clip-budget weight multiplier for tensors matching "
+                         "--classifier_substring, used only when --clip_mode per_tensor.")
+    p.add_argument("--classifier_substring", type=str, default="classifier",
+                    help="Substring matched against param names to find the classifier head. "
+                         "VERIFY this actually matches something at startup -- the script "
+                         "prints the matched tensor names before training begins.")
+
+    p.add_argument("--index_bytes_per_element", type=int, default=4,
+                    help="Bytes per sparse-encoded index (int32), used only for the "
+                         "comm_sparse_encoded_bytes estimate, not for what's actually sent.")
+
+    p.add_argument("--tag", type=str, default="run",
+                    help="Suffix for output files (best_model_<tag>.pth, "
+                         "final_confusion_matrix_<tag>.png) so sweep runs don't overwrite "
+                         "each other.")
+
+    args, _unknown = p.parse_known_args()  # parse_known_args: tolerate notebook/Colab kernel args
+    return args
+
+
+ARGS = parse_args()
+
+with open("config.json", "r") as f:
     config = json.load(f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -189,85 +245,34 @@ torch.manual_seed(42)
 np.random.seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
-NUM_CLIENTS = 3
-LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
 
-# ---- privacy strategy knobs ----
-USE_PRIVACY = True
-PRIVACY_KEEP_RATIO = 0.3     # fraction of each tensor's elements transmitted
-PRIVACY_QUANT_BITS = 8       # bits for stochastic quantization
+NUM_CLIENTS = ARGS.num_clients
+LOCAL_EPOCHS = ARGS.local_epochs
+NUM_ROUNDS = ARGS.num_rounds
 
-# ---- DP add-on knobs (SAPM+DP hybrid) ----
-USE_DP_NOISE = True          # master switch for the new noise mechanism;
-                              # False reproduces the original SAPM script.
-PRIVACY_DP_EPSILON = 40.0    # UPDATED from 8.0. This was the best point in
-                              # the earlier offline sweep (dp_calibrate.py)
-                              # -- epsilon and keep_ratio were the only two
-                              # levers that improved projected SNR without
-                              # hitting a hard ceiling; clip_norm alone
-                              # (tested previous run) did NOT help, since
-                              # sigma scales with clip_norm too and the two
-                              # effects roughly cancel. Raising epsilon is a
-                              # real privacy/utility tradeoff -- this is a
-                              # materially weaker per-round guarantee than
-                              # epsilon=8, not a free win. sigma should drop
-                              # ~5x vs the epsilon=8 runs (sigma ∝ 1/epsilon).
-PRIVACY_DP_DELTA = 1e-5      # PER-ROUND delta
-PRIVACY_DP_CLIP_NORM = 1.49  # UPDATED from the default 1.0. Measured across
-                              # two separate instrumented runs at
-                              # keep_ratio=0.3 (global mode: avg=1.4888,
-                              # min=1.4825, max=1.4942; per-tensor mode:
-                              # ~1.4826-1.4638) -- consistent enough to trust.
-                              # At clip_norm=1.0 this was forcing clip_scale
-                              # ~0.67-0.69 every round (aggressive, lossy
-                              # clipping before noise was even added).
-                              # Re-check the [dp-calib] line after changing
-                              # keep_ratio, model size, or LOCAL_EPOCHS --
-                              # dp_raw_norm depends on those, so this value
-                              # isn't universal, just calibrated for the
-                              # settings you've been running.
+USE_PRIVACY = ARGS.use_privacy
+PRIVACY_KEEP_RATIO = ARGS.keep_ratio
 
-# ---- DP clip allocation strategy (NEW) ----
-DP_CLIP_MODE = "global"       # "global"    -- one proportional L2 rescale
-                               #                over the whole concatenated
-                               #                selected-value vector
-                               #                (original behavior).
-                               # "per_tensor" -- same total clip budget
-                               #                (same overall sensitivity,
-                               #                same sigma), but split into
-                               #                a per-tensor share via
-                               #                pu.per_tensor_clip_norms.
-                               #                Mathematically the same
-                               #                (epsilon, delta) guarantee
-                               #                as "global" -- only the
-                               #                allocation across tensors
-                               #                differs. Compare dp_snr
-                               #                between the two modes
-                               #                empirically; neither is
-                               #                automatically better.
-DP_TENSOR_WEIGHTS = None      # Only used when DP_CLIP_MODE == "per_tensor".
-                               # dict {tensor_name_substring: weight} to
-                               # bias the clip budget toward specific
-                               # tensors (e.g. the classifier head). None
-                               # => weight sqrt(tensor_size) per tensor,
-                               # which stays close to what "global" does.
-                               # Example to try: give the final classifier
-                               # layer more room:
-                               #   DP_TENSOR_WEIGHTS = {"classifier": 5.0}
-                               # (substring-matched against param names;
-                               # unmatched tensors fall back to weight 1.0)
+USE_DP_NOISE = ARGS.use_dp_noise
+PRIVACY_DP_EPSILON = ARGS.epsilon
+PRIVACY_DP_DELTA = ARGS.delta
+PRIVACY_DP_CLIP_NORM = ARGS.clip_norm
 
-# ---- overhead-accounting knobs ----
-INDEX_BYTES_PER_ELEMENT = 4  # bytes needed per sparse-encoded index (int32);
-                              # used only for the comm_sparse_encoded_bytes
-                              # estimate, not for the actual bytes sent.
+DP_CLIP_MODE = ARGS.clip_mode
+DP_TENSOR_WEIGHTS = {ARGS.classifier_substring: ARGS.classifier_weight} if ARGS.clip_mode == "per_tensor" else None
+
+INDEX_BYTES_PER_ELEMENT = ARGS.index_bytes_per_element
+TAG = ARGS.tag
 
 print(f"Using device: {DEVICE}")
-print(f"Privacy strategy: SAPM | enabled={USE_PRIVACY} | keep_ratio={PRIVACY_KEEP_RATIO} | quant_bits={PRIVACY_QUANT_BITS}")
+print(f"Privacy strategy: SAPM (no quant/permute) | enabled={USE_PRIVACY} | keep_ratio={PRIVACY_KEEP_RATIO}")
 print(f"DP add-on: enabled={USE_DP_NOISE} | epsilon(per-round)={PRIVACY_DP_EPSILON} | "
       f"delta(per-round)={PRIVACY_DP_DELTA} | clip_norm={PRIVACY_DP_CLIP_NORM} | "
-      f"clip_mode={DP_CLIP_MODE}")
+      f"clip_mode={DP_CLIP_MODE}"
+      + (f" | classifier_weight={ARGS.classifier_weight} (substring='{ARGS.classifier_substring}')"
+         if DP_CLIP_MODE == "per_tensor" else ""))
+print(f"Run tag: {TAG}")
+
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -276,37 +281,25 @@ def load_data(train_csv: str, test_csv: str):
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
 
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS, save_file="client_split.json", seed=42):
+
+def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=42):
     n = len(train_dataset)
     indices = np.arange(n)
-
     np.random.seed(seed)
     np.random.shuffle(indices)
 
     client_datasets = []
     size = n // num_clients
-
     print(f"\n=== Client Data Distribution (Seed={seed}) ===")
-
     for i in range(num_clients):
         start = i * size
         end = start + size if i < num_clients - 1 else n
         subset = Subset(train_dataset, indices[start:end])
         client_datasets.append(subset)
-
-        labels = []
-        for idx in indices[start:end]:
-            sample = train_dataset[idx]
-            label = sample['label'].item() if torch.is_tensor(sample['label']) else sample['label']
-            labels.append(label)
-
-        unique, counts = np.unique(labels, return_counts=True)
-        dist = dict(zip(unique.tolist(), counts.tolist()))
-
-        print(f"Client {i} → {len(subset)} samples | Label distribution: {dist}")
-
+        print(f"Client {i} -> {len(subset)} samples")
     print("=" * 60)
     return client_datasets
+
 
 # ====================== CLIENT ======================
 class IMUClient(fl.client.NumPyClient):
@@ -333,8 +326,6 @@ class IMUClient(fl.client.NumPyClient):
 
         use_privacy = fit_config.get("use_privacy", USE_PRIVACY)
         keep_ratio = fit_config.get("privacy_keep_ratio", PRIVACY_KEEP_RATIO)
-        quant_bits = fit_config.get("privacy_quant_bits", PRIVACY_QUANT_BITS)
-        round_seed = fit_config.get("privacy_seed", 0)
 
         use_dp_noise = fit_config.get("use_dp_noise", USE_DP_NOISE) and use_privacy
         dp_epsilon = fit_config.get("privacy_dp_epsilon", PRIVACY_DP_EPSILON)
@@ -378,6 +369,7 @@ class IMUClient(fl.client.NumPyClient):
             fisher_accum[k] /= max(1, n_grad_steps)
 
         new_state = self.model.state_dict()
+        state_keys_in_order = list(new_state.keys())  # authoritative order for output
 
         comm_no_privacy_bytes = 0
 
@@ -407,22 +399,17 @@ class IMUClient(fl.client.NumPyClient):
             priv_mask[name] = mask
             priv_shape[name] = delta.shape
 
-        # ===== PASS 2: global clip + Gaussian noise =====
+        # ===== PASS 2: clip + Gaussian noise (global or per-tensor budget) =====
         dp_time_sec = 0.0
-        dp_scale = 1.0          # global mode: single scale factor
-                                 # per_tensor mode: mean of per-tensor scales (see dp_scale_min/max)
+        dp_scale = 1.0
         dp_scale_min = 1.0
         dp_scale_max = 1.0
         dp_sigma = 0.0
         dp_k_total = 0
         dp_signal_mean_abs = 0.0
-        dp_raw_norm = 0.0       # L2 norm of the selected-value vector BEFORE
-                                 # clipping. In "global" mode this is the
-                                 # norm of the whole concatenated vector; in
-                                 # "per_tensor" mode it's still reported as
-                                 # the norm of the whole concatenated vector
-                                 # (pre any clipping) so the two modes stay
-                                 # directly comparable in the [dp-calib] line.
+        dp_raw_norm = 0.0  # pre-clip L2 norm of the whole selected-value vector,
+                            # reported the same way regardless of clip_mode so the
+                            # two modes stay directly comparable in [dp-calib].
 
         noised_selected = {}
 
@@ -437,11 +424,11 @@ class IMUClient(fl.client.NumPyClient):
             if use_dp_noise and dp_k_total > 0:
                 global_vec = np.concatenate([per_name_selected[name] for name in priv_names]).astype(np.float32)
                 dp_signal_mean_abs = float(np.mean(np.abs(global_vec))) if global_vec.size else 0.0
-                dp_raw_norm = float(np.linalg.norm(global_vec))  # pre-clip norm, comparable across modes
+                dp_raw_norm = float(np.linalg.norm(global_vec))
 
-                # sigma is ALWAYS calibrated from the TOTAL clip_norm,
-                # regardless of clip_mode -- this is what keeps (epsilon,
-                # delta) identical between "global" and "per_tensor".
+                # sigma is ALWAYS calibrated from the TOTAL clip_norm, regardless of
+                # clip_mode -- this is what keeps (epsilon, delta) identical between
+                # "global" and "per_tensor".
                 dp_sigma = pu.gaussian_mechanism_sigma(dp_clip_norm, dp_epsilon, dp_delta)
 
                 if dp_clip_mode == "per_tensor":
@@ -458,7 +445,7 @@ class IMUClient(fl.client.NumPyClient):
                     dp_scale = float(np.mean(scales)) if scales else 1.0
                     dp_scale_min = float(np.min(scales)) if scales else 1.0
                     dp_scale_max = float(np.max(scales)) if scales else 1.0
-                else:  # "global" -- original behavior, one joint clip
+                else:  # "global" -- one joint clip over the concatenated vector
                     clipped_vec, dp_scale = pu.clip_l2(global_vec, dp_clip_norm)
                     dp_scale_min = dp_scale_max = dp_scale
                     noised_vec = pu.add_gaussian_noise(clipped_vec, dp_sigma).astype(np.float32)
@@ -472,18 +459,15 @@ class IMUClient(fl.client.NumPyClient):
 
             dp_time_sec = time.perf_counter() - _dp_t0
 
-        # ===== PASS 3: scatter noised values back, quantize, permute =====
-        out_arrays = []
-        meta = []
+        # ===== PASS 3: scatter noised values back into dense arrays (no quant/permute) =====
+        out_by_name = {}
         nz_total, elem_total = 0, 0
         comm_dense_bytes = 0
         comm_sparse_encoded_bytes = 0
-        transform_time_sec = 0.0
 
         for name in plain_names:
             arr = plain_arrays[name]
-            out_arrays.append(arr)
-            meta.append([1.0, 0.0, False])
+            out_by_name[name] = arr
             nz_total += np.count_nonzero(arr)
             elem_total += arr.size
             comm_dense_bytes += arr.nbytes
@@ -492,39 +476,33 @@ class IMUClient(fl.client.NumPyClient):
         for name in priv_names:
             mask = priv_mask[name]
             shape = priv_shape[name]
-            delta_flat = priv_delta_flat[name]
 
-            _t0 = time.perf_counter()
-            sparse_delta = np.zeros_like(delta_flat)
+            sparse_delta = np.zeros_like(priv_delta_flat[name])
             sparse_delta[mask] = noised_selected[name]
-
-            scale, zmin = pu.compute_quant_params(delta_flat)
-            q = pu.quantize_with_params(sparse_delta, scale, zmin, quant_bits)
-            permuted = pu.permute_array(q, seed=round_seed * 100003 + deterministic_hash(name) % 97)
-            transform_time_sec += time.perf_counter() - _t0
-
-            out_arrays.append(permuted.reshape(shape).astype(np.float32))
-            meta.append([float(scale), float(zmin), True])
+            sparse_delta = sparse_delta.reshape(shape).astype(np.float32)
+            out_by_name[name] = sparse_delta
 
             nz_count = int(np.count_nonzero(mask))
             nz_total += np.count_nonzero(sparse_delta)
             elem_total += sparse_delta.size
 
-            comm_dense_bytes += permuted.astype(np.float32).nbytes
-            value_bytes = max(1, -(-quant_bits // 8))
-            comm_sparse_encoded_bytes += nz_count * (INDEX_BYTES_PER_ELEMENT + value_bytes)
+            comm_dense_bytes += sparse_delta.nbytes
+            # no quantization now -> 4 bytes/value for the sparse-encoded estimate
+            comm_sparse_encoded_bytes += nz_count * (INDEX_BYTES_PER_ELEMENT + 4)
+
+        # Explicit reorder into state_dict key order -- don't rely on
+        # "plain tensors happened to come first" being true for this model.
+        out_arrays = [out_by_name[name] for name in state_keys_in_order]
 
         dp_snr = (dp_signal_mean_abs / dp_sigma) if dp_sigma > 0 else float("inf")
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
             "nonzero_ratio": float(nz_total / max(1, elem_total)),
-            "privacy_meta": json.dumps(meta),
             "comm_dense_bytes": comm_dense_bytes,
             "comm_sparse_encoded_bytes": comm_sparse_encoded_bytes,
             "comm_no_privacy_bytes": comm_no_privacy_bytes,
             "fisher_time_sec": fisher_time_sec,
-            "transform_time_sec": transform_time_sec,
             "dp_time_sec": dp_time_sec,
             "dp_clip_norm": dp_clip_norm,
             "dp_epsilon": dp_epsilon,
@@ -544,28 +522,25 @@ class IMUClient(fl.client.NumPyClient):
     def evaluate(self, parameters, eval_config):
         self.set_parameters(parameters)
         self.model.eval()
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
 
         with torch.no_grad():
             for batch in self.train_loader:
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
-
                 output = self.model({"imu": imu})
                 pred = output.argmax(dim=1)
-
                 all_preds.extend(pred.cpu().numpy())
                 all_labels.extend(label.cpu().numpy())
 
         accuracy = accuracy_score(all_labels, all_preds)
         return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}
 
+
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, use_privacy=USE_PRIVACY,
                  privacy_keep_ratio=PRIVACY_KEEP_RATIO,
-                 privacy_quant_bits=PRIVACY_QUANT_BITS,
                  use_dp_noise=USE_DP_NOISE,
                  privacy_dp_epsilon=PRIVACY_DP_EPSILON,
                  privacy_dp_delta=PRIVACY_DP_DELTA,
@@ -579,7 +554,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.best_acc = 0.0
         self.use_privacy = use_privacy
         self.privacy_keep_ratio = privacy_keep_ratio
-        self.privacy_quant_bits = privacy_quant_bits
         self.use_dp_noise = use_dp_noise
         self.privacy_dp_epsilon = privacy_dp_epsilon
         self.privacy_dp_delta = privacy_dp_delta
@@ -591,20 +565,33 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.total_comm_sparse_encoded_bytes = 0
         self.total_comm_no_privacy_bytes = 0
         self.total_fisher_time_sec = 0.0
-        self.total_transform_time_sec = 0.0
-        self.total_reconstruct_time_sec = 0.0
         self.total_dp_time_sec = 0.0
         self.dp_sigma_history = []
         self.dp_snr_history = []
         self.dp_k_total_history = []
-        self.dp_raw_norm_history = []  # NEW
+        self.dp_raw_norm_history = []
+
+        if self.dp_clip_mode == "per_tensor" and self.dp_tensor_weights:
+            matched = [n for n, _ in self.global_model.named_parameters()
+                       if any(s in n for s in self.dp_tensor_weights)]
+            print(f"\n[per_tensor clip_mode] classifier weight={self.dp_tensor_weights} "
+                  f"matched {len(matched)} tensor(s):")
+            for n in matched:
+                print(f"    {n}")
+            if not matched:
+                print("    *** WARNING: NO TENSORS MATCHED. The classifier substring "
+                      "doesn't hit any param name -- every tensor is falling back to "
+                      "weight 1.0. Check --classifier_substring against your model's "
+                      "actual layer names (see the list below). ***")
+                print("  Full parameter name list:")
+                for n, _ in self.global_model.named_parameters():
+                    print(f"    {n}")
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_privacy"] = self.use_privacy
             fit_ins.config["privacy_keep_ratio"] = self.privacy_keep_ratio
-            fit_ins.config["privacy_quant_bits"] = self.privacy_quant_bits
             fit_ins.config["privacy_seed"] = server_round
             fit_ins.config["use_dp_noise"] = self.use_dp_noise
             fit_ins.config["privacy_dp_epsilon"] = self.privacy_dp_epsilon
@@ -630,8 +617,6 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         round_comm_sparse_encoded_bytes = 0
         round_comm_no_privacy_bytes = 0
         round_fisher_time_sec = []
-        round_transform_time_sec = []
-        round_reconstruct_time_sec = 0.0
 
         round_dp_time_sec = []
         round_dp_sigma = []
@@ -645,14 +630,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
             num_examples = fit_res.num_examples
-            meta = json.loads(fit_res.metrics.get("privacy_meta", "[]"))
             nz_ratios.append(fit_res.metrics.get("nonzero_ratio", 1.0))
 
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
             round_comm_sparse_encoded_bytes += fit_res.metrics.get("comm_sparse_encoded_bytes", 0)
             round_comm_no_privacy_bytes += fit_res.metrics.get("comm_no_privacy_bytes", 0)
             round_fisher_time_sec.append(fit_res.metrics.get("fisher_time_sec", 0.0))
-            round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
 
             round_dp_time_sec.append(fit_res.metrics.get("dp_time_sec", 0.0))
             round_dp_sigma.append(fit_res.metrics.get("dp_sigma", 0.0))
@@ -663,20 +646,11 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             round_dp_scale_max.append(fit_res.metrics.get("dp_scale_max", 1.0))
             round_dp_raw_norm.append(fit_res.metrics.get("dp_raw_norm", 0.0))
 
-            _recon_start = time.perf_counter()
-            for i, (k, arr) in enumerate(zip(keys, arrays)):
-                scale, zmin, quantized = meta[i] if i < len(meta) else (1.0, 0.0, False)
-                flat = arr.reshape(-1)
-
-                if quantized:
-                    seed = server_round * 100003 + deterministic_hash(k) % 97
-                    unpermuted = pu.unpermute_array(flat, seed=seed, size=flat.size)
-                    reconstructed = pu.dequantize_with_params(unpermuted, scale, zmin, self.privacy_quant_bits)
-                else:
-                    reconstructed = flat
-
-                weighted_deltas[k] += reconstructed.reshape(global_state[k].shape).astype(np.float64) * num_examples
-            round_reconstruct_time_sec += time.perf_counter() - _recon_start
+            # No unpermute/dequantize anymore -- arrays are used directly.
+            # `arrays` already arrives in state_dict key order (client sends
+            # them explicitly reordered by state_keys_in_order).
+            for k, arr in zip(keys, arrays):
+                weighted_deltas[k] += arr.reshape(global_state[k].shape).astype(np.float64) * num_examples
 
             total_examples += num_examples
 
@@ -695,10 +669,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.total_comm_sparse_encoded_bytes += round_comm_sparse_encoded_bytes
         self.total_comm_no_privacy_bytes += round_comm_no_privacy_bytes
         avg_fisher_time = float(np.mean(round_fisher_time_sec)) if round_fisher_time_sec else 0.0
-        avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
         self.total_fisher_time_sec += avg_fisher_time
-        self.total_transform_time_sec += avg_transform_time
-        self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
         avg_dp_time = float(np.mean(round_dp_time_sec)) if round_dp_time_sec else 0.0
         avg_dp_sigma = float(np.mean(round_dp_sigma)) if round_dp_sigma else 0.0
@@ -713,7 +684,7 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.dp_sigma_history.append(avg_dp_sigma)
         self.dp_snr_history.append(avg_dp_snr)
         self.dp_k_total_history.append(avg_dp_k_total)
-        self.dp_raw_norm_history.append(avg_dp_raw_norm)  # NEW
+        self.dp_raw_norm_history.append(avg_dp_raw_norm)
 
         compression_vs_no_privacy = (
             round_comm_sparse_encoded_bytes / round_comm_no_privacy_bytes
@@ -721,13 +692,11 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         )
         print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | Avg transmitted nonzero ratio: {avg_nz:.3f}")
         print(f"  [comm] as-sent (dense): {round_comm_dense_bytes/1e6:.3f} MB | "
-              f"sparse-encoded (achievable): {round_comm_sparse_encoded_bytes/1e6:.3f} MB "
+              f"sparse-encoded (achievable, no quant): {round_comm_sparse_encoded_bytes/1e6:.3f} MB "
               f"({compression_vs_no_privacy*100:.1f}% of no-privacy baseline) | "
               f"no-privacy baseline: {round_comm_no_privacy_bytes/1e6:.3f} MB")
         print(f"  [compute] avg client fisher_time: {avg_fisher_time*1000:.2f}ms | "
-              f"avg client dp_time: {avg_dp_time*1000:.2f}ms | "
-              f"avg client transform_time: {avg_transform_time*1000:.2f}ms | "
-              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
+              f"avg client dp_time: {avg_dp_time*1000:.2f}ms")
         scale_spread = (f" (range {avg_dp_scale_min:.4f}-{avg_dp_scale_max:.4f} across tensors)"
                         if self.dp_clip_mode == "per_tensor" else "")
         print(f"  [dp] mode={self.dp_clip_mode} | k_total={avg_dp_k_total:.0f} | "
@@ -735,17 +704,13 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
               f"sigma={avg_dp_sigma:.6g} | snr={avg_dp_snr:.3f} "
               f"(epsilon={self.privacy_dp_epsilon}, delta={self.privacy_dp_delta}, "
               f"clip_norm={self.privacy_dp_clip_norm})")
-        # NEW: calibration line. If avg_dp_raw_norm is >> clip_norm, clipping
-        # is throwing away real signal before noise is even added -- raise
-        # clip_norm toward this value. If it's << clip_norm, you have slack
-        # to LOWER clip_norm (which lowers sigma too, for free SNR).
         print(f"  [dp-calib] avg pre-clip L2 norm of selected values: {avg_dp_raw_norm:.4f} "
               f"(current clip_norm={self.privacy_dp_clip_norm} -> "
               f"{'clipping is lossy, raise clip_norm' if avg_dp_raw_norm > self.privacy_dp_clip_norm * 1.05 else 'clip_norm has slack, could lower it to cut sigma'})")
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
+            torch.save(self.global_model.state_dict(), f"best_model_{TAG}.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
@@ -763,30 +728,27 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         }
 
     def print_overhead_summary(self):
-        print("\n========== OVERHEAD SUMMARY (SAPM, cumulative over the run) ==========")
+        print("\n========== OVERHEAD SUMMARY (SAPM+DP, cumulative over the run) ==========")
         print(f"Total communication AS ACTUALLY SENT (dense arrays)      : "
               f"{self.total_comm_dense_bytes/1e6:.2f} MB")
-        print(f"Total communication IF SPARSE-ENCODED (achievable target): "
+        print(f"Total communication IF SPARSE-ENCODED (achievable, no quant): "
               f"{self.total_comm_sparse_encoded_bytes/1e6:.2f} MB")
-        print(f"Total communication with NO privacy (dense, keep_ratio=1): "
+        print(f"Total communication with NO privacy (dense, keep_ratio=1) : "
               f"{self.total_comm_no_privacy_bytes/1e6:.2f} MB")
         if self.total_comm_no_privacy_bytes:
             print(f"  -> as-sent is {self.total_comm_dense_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
-                  f"of no-privacy baseline (i.e. NO bandwidth savings today -- see module docstring)")
+                  f"of no-privacy baseline (no bandwidth savings until sparse-encoding is "
+                  f"actually implemented on the wire)")
             print(f"  -> sparse-encoded WOULD BE {self.total_comm_sparse_encoded_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
                   f"of no-privacy baseline if implemented")
         print(f"Total client-side fisher accumulation time (avg client, summed over rounds): "
               f"{self.total_fisher_time_sec:.2f}s")
         print(f"Total client-side DP clip+noise time (avg client, summed over rounds)      : "
               f"{self.total_dp_time_sec:.2f}s")
-        print(f"Total client-side transform time (mask+quant+permute, avg client, summed)  : "
-              f"{self.total_transform_time_sec:.2f}s")
-        print(f"Total server-side reconstruct time (unpermute+dequantize, summed over rounds): "
-              f"{self.total_reconstruct_time_sec:.2f}s")
 
         print("\n---- DP (SAPM+DP hybrid) summary ----")
         print(f"Per-round budget used: epsilon={self.privacy_dp_epsilon}, delta={self.privacy_dp_delta}, "
-              f"clip_norm={self.privacy_dp_clip_norm}")
+              f"clip_norm={self.privacy_dp_clip_norm}, clip_mode={self.dp_clip_mode}")
         naive_total_epsilon = self.privacy_dp_epsilon * NUM_ROUNDS
         print(f"Naive BASIC-COMPOSITION total epsilon over {NUM_ROUNDS} rounds: {naive_total_epsilon:.2f} "
               f"(crude, conservative upper bound -- use an RDP/moments accountant for a tight bound)")
@@ -796,39 +758,39 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         if self.dp_k_total_history:
             avg_k = float(np.mean(self.dp_k_total_history))
             print(f"Average number of coordinates actually noised per round (k_total): {avg_k:.0f}")
-        if self.dp_raw_norm_history:  # NEW
+        if self.dp_raw_norm_history:
             arr = np.array(self.dp_raw_norm_history)
             print(f"Pre-clip L2 norm of selected values across rounds: "
                   f"min={arr.min():.4f} avg={arr.mean():.4f} max={arr.max():.4f}")
             print(f"  -> SUGGESTED clip_norm to try next: ~{arr.mean():.4f} "
-                  f"(currently set to {self.privacy_dp_clip_norm}). Setting clip_norm this low "
-                  f"({self.privacy_dp_clip_norm}) for a {int(np.mean(self.dp_k_total_history))}-dim vector was "
-                  f"forcing aggressive, lossy clipping every round on top of the noise.")
+                  f"(currently set to {self.privacy_dp_clip_norm}).")
         finite_snrs = [s for s in self.dp_snr_history if np.isfinite(s)]
         if finite_snrs:
-            print(f"Average empirical signal-to-noise ratio (mean|selected value| / sigma): "
-                  f"{np.mean(finite_snrs):.3f}")
+            avg_snr = float(np.mean(finite_snrs))
+            print(f"Average empirical signal-to-noise ratio (mean|selected value| / sigma): {avg_snr:.4f}")
+            if avg_snr < 0.5:
+                needed_k_shrink = (avg_snr and (0.5 / avg_snr) ** 2) or None
+                print(f"  -> SNR well below a usable range (target roughly >= 0.5-1.0). Since "
+                      f"per-coordinate signal scales ~ raw_norm/sqrt(k), reaching SNR~0.5 from "
+                      f"here would need k to shrink by roughly {needed_k_shrink:.0f}x if nothing "
+                      f"else changes -- i.e. keep_ratio is very likely the lever to pull next, "
+                      f"not epsilon. Try keep_ratio in the 0.01-0.1 range and re-check this line.")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
-
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
 
         with torch.no_grad():
             for batch in self.test_loader:
                 imu = batch["imu"].to(DEVICE).float()
                 labels = batch["label"].to(DEVICE).long()
-
                 outputs = self.global_model({"imu": imu})
                 preds = outputs.argmax(dim=1)
-
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
-
         accuracy = accuracy_score(all_labels, all_preds)
 
         if not final:
@@ -842,24 +804,23 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         print(f"Precision: {precision:.4f}")
         print(f"Recall   : {recall:.4f}")
         print(f"F1 Score : {f1:.4f}")
-
         print("\nClassification Report")
         print(classification_report(all_labels, all_preds, zero_division=0))
 
         cm = confusion_matrix(all_labels, all_preds)
-
         print("\nConfusion Matrix")
         print(cm)
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (SAPM+DP)")
+        plt.title(f"Final Confusion Matrix (SAPM+DP, {TAG})")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_sapm_dp.png")
+        plt.savefig(f"final_confusion_matrix_{TAG}.png")
         plt.close()
 
         return accuracy
+
 
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
@@ -875,16 +836,13 @@ def main(train_csv: str, test_csv: str):
             cid = int(context.node_config["cid"])
         else:
             cid = 0
-
         client_idx = cid % len(client_datasets)
-
         return IMUClient(client_datasets[client_idx]).to_client()
 
     strategy = SaveModelStrategy(
         test_loader=test_loader,
         use_privacy=USE_PRIVACY,
         privacy_keep_ratio=PRIVACY_KEEP_RATIO,
-        privacy_quant_bits=PRIVACY_QUANT_BITS,
         use_dp_noise=USE_DP_NOISE,
         privacy_dp_epsilon=PRIVACY_DP_EPSILON,
         privacy_dp_delta=PRIVACY_DP_DELTA,
@@ -903,5 +861,6 @@ def main(train_csv: str, test_csv: str):
         client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
     )
 
+
 if __name__ == "__main__":
-    main("train.csv", "test.csv")
+    main(ARGS.train_csv, ARGS.test_csv)
