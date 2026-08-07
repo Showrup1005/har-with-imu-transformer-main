@@ -143,13 +143,22 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 40                   
 
 USE_COMPRESSION = True
 COMPRESS_KEEP_RATIO_START = 0.6   # round 1
-COMPRESS_KEEP_RATIO_END = 0.15    # final round; cosine decay between the two
+COMPRESS_KEEP_RATIO_END = 0.22    # was 0.15 -- 0.15 was still starving late-stage fine-tuning
 QUANT_BITS = 8
 STABILITY_LAMBDA = 0.01           # weight on the Fisher-weighted stability regularizer
+
+# Tensors at or below this many elements (biases, LayerNorm params, the
+# final classifier head) are sent dense + unquantized every round. They
+# are cheap in absolute bytes no matter what, but disproportionately
+# important for class boundaries -- masking/quantizing them saves
+# almost nothing on the wire while directly hurting accuracy on the
+# hardest, most confusable classes. Everything above this threshold
+# still goes through the full mask+quantize pipeline as before.
+SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096
 
 print(f"Using device: {DEVICE}")
 print(f"Compression strategy: SAC | enabled={USE_COMPRESSION} | "
@@ -287,11 +296,12 @@ class IMUClient(fl.client.NumPyClient):
             delta = (new_val - old_val).cpu().numpy()
             comm_no_compression_bytes += delta.astype(np.float32).nbytes
 
-            if not use_compression or name not in fisher_accum:
+            if (not use_compression or name not in fisher_accum
+                    or delta.size <= SMALL_TENSOR_FULL_SEND_THRESHOLD):
                 out_arrays.append(delta.astype(np.float32))
                 meta.append({"quantized": False, "sparse": False,
                              "shape": list(delta.shape), "size": int(delta.size)})
-                nz_total += np.count_nonzero(delta)
+                nz_total += delta.size  # counted as fully "kept" for the nonzero-ratio metric
                 elem_total += delta.size
                 comm_dense_bytes += delta.astype(np.float32).nbytes
                 comm_bitpacked_bytes += delta.astype(np.float32).nbytes
