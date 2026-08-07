@@ -217,8 +217,12 @@ def parse_args():
     p.add_argument("--classifier_weight", type=float, default=5.0,
                     help="Clip-budget weight multiplier for tensors matching "
                          "--classifier_substring, used only when --clip_mode per_tensor.")
-    p.add_argument("--classifier_substring", type=str, default="classifier",
+    p.add_argument("--classifier_substring", type=str, default="imu_head",
                     help="Substring matched against param names to find the classifier head. "
+                         "Defaults to 'imu_head' -- this model's actual head layer name, "
+                         "confirmed from the printed parameter list ('classifier' matched "
+                         "nothing). Pass 'imu_head.4' instead to weight only the final "
+                         "linear layer of the head rather than the whole head block. "
                          "VERIFY this actually matches something at startup -- the script "
                          "prints the matched tensor names before training begins.")
 
@@ -332,7 +336,17 @@ class IMUClient(fl.client.NumPyClient):
         dp_delta = fit_config.get("privacy_dp_delta", PRIVACY_DP_DELTA)
         dp_clip_norm = fit_config.get("privacy_dp_clip_norm", PRIVACY_DP_CLIP_NORM)
         dp_clip_mode = fit_config.get("dp_clip_mode", DP_CLIP_MODE)
-        dp_tensor_weights = fit_config.get("dp_tensor_weights", DP_TENSOR_WEIGHTS)
+        # Flower's FitIns.config only accepts scalar types (bool/bytes/float/int/str) --
+        # a raw dict here throws inside the Ray worker with zero useful traceback, which
+        # is what "aggregate_fit: received 0 results and N failures" every round means.
+        # The server JSON-encodes this dict before putting it in config; decode it back here.
+        _dp_tensor_weights_raw = fit_config.get("dp_tensor_weights", None)
+        if _dp_tensor_weights_raw is None:
+            dp_tensor_weights = DP_TENSOR_WEIGHTS
+        elif isinstance(_dp_tensor_weights_raw, str):
+            dp_tensor_weights = json.loads(_dp_tensor_weights_raw)
+        else:
+            dp_tensor_weights = _dp_tensor_weights_raw
 
         self.model.train()
         total_loss = 0.0
@@ -599,7 +613,9 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             fit_ins.config["privacy_dp_clip_norm"] = self.privacy_dp_clip_norm
             fit_ins.config["dp_clip_mode"] = self.dp_clip_mode
             if self.dp_tensor_weights is not None:
-                fit_ins.config["dp_tensor_weights"] = self.dp_tensor_weights
+                # JSON-encode: Flower's FitIns.config values must be scalar
+                # (bool/bytes/float/int/str), not dict -- see client-side note in fit().
+                fit_ins.config["dp_tensor_weights"] = json.dumps(self.dp_tensor_weights)
         return fit_ins_list
 
     def aggregate_fit(self, server_round, results, failures):
