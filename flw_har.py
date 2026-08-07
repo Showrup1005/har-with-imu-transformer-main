@@ -1,57 +1,51 @@
 """
-Federated HAR training with Gaussian-mechanism Differential Privacy.
+Federated HAR training with SAPM-Stable
+(Sensitivity-Aware Private Masking + real sparse transmission +
+ decaying keep_ratio schedule + Fisher-weighted local regularization).
 
-Replaces the SAPM (Fisher top-k + quantization + permutation) pipeline.
-Model, dataset, and overall FL loop are unchanged. What changed:
+This extends fl_train.py (SAPM) with three changes, each independently
+verifiable from the printed metrics:
 
-  - Quantization and permutation are REMOVED. They added compute and
-    (per the SAPM docstring) didn't reduce bytes sent anyway, and neither
-    one gave a provable privacy guarantee -- permutation is invertible by
-    the server (it needs to be, to aggregate), and unbounded stochastic
-    rounding has no calibrated sensitivity/epsilon behind it.
+  1. REAL SPARSE TRANSMISSION
+     The original SAPM script builds a full D-length dense array with
+     (1-keep_ratio) of it zeroed and sends that whole array -- so
+     keep_ratio never actually reduced bytes on the wire.
+     Here, each masked tensor is sent as TWO short arrays: int32
+     indices and their quantized values, both of length nz_count (the
+     number of kept elements), instead of one D-length dense array.
+     comm_dense_bytes below is now genuinely "what got sent" -- you
+     can compare it directly against comm_no_privacy_bytes to see a
+     real compression ratio, not a hypothetical one.
 
-  - In their place: per-client delta clipping to a fixed L2 norm C,
-    followed by a SINGLE calibrated Gaussian noise draw added to the
-    SUM of clipped deltas at the server (not per-client), before
-    averaging. This is standard DP-FedAvg (McMahan et al., 2017).
+  2. DECAYING KEEP_RATIO SCHEDULE
+     keep_ratio starts high (more signal while the model is still
+     learning) and decays toward a lower floor over the course of
+     training (more compression once the model is closer to
+     converged). Cosine schedule between PRIVACY_KEEP_RATIO_START and
+     PRIVACY_KEEP_RATIO_END, set server-side and broadcast per round.
 
-  - Cumulative privacy loss is tracked with Opacus's RDP accountant
-    across all NUM_ROUNDS releases and printed every round and at the
-    end, so you always know exactly how much epsilon has been spent.
+  3. FISHER-WEIGHTED LOCAL REGULARIZATION (EWC-lite)
+     Local loss becomes CE + EWC_LAMBDA * sum_i F_i * (theta_i -
+     theta_global_i)^2, using the SAME running Fisher accumulator SAPM
+     already computes -- no extra backward pass, no extra tensors.
+     F_i is the running (not-yet-finalized) per-parameter Fisher
+     estimate at that point in local training. This discourages the
+     client from moving far, on the parameters the model is most
+     sensitive to, away from the round's starting point -- which
+     matters more as keep_ratio drops and less of the update survives
+     to be transmitted, so the client should spend its "budget" of
+     transmitted signal on directions that matter and not wander on
+     the rest.
+     NOTE / approximation: the Fisher accumulator is updated from the
+     COMBINED loss gradient (CE + regularizer), not a CE-only gradient,
+     to avoid a second backward pass per step. This mildly contaminates
+     the Fisher signal with the regularizer's own curvature; in
+     practice this effect is small for reasonable EWC_LAMBDA and is a
+     deliberate simplicity/cost tradeoff -- flagged here rather than
+     hidden.
 
-WHY NOISE IS ADDED ONCE, TO THE SUM, NOT PER-CLIENT:
-  If every client independently added noise before sending, the noise
-  variances would ADD across clients. Instead: sum the CLIPPED (not yet
-  noised) deltas, add exactly one Gaussian draw scaled to sigma*C to
-  that sum, THEN divide by n_clients. The real signal in the sum scales
-  with n_clients; the single noise draw does not -- so the averaged
-  update's noise shrinks roughly as (sigma*C / n_clients). This is the
-  main lever for keeping DP noise from swamping the model.
-
-CAVEAT WORTH KNOWING BEFORE YOU TUNE THIS (updated after round-2 NaNs on
-the NUM_CLIENTS=3 / NUM_ROUNDS=40 config):
-  The noise-to-signal ratio for this mechanism is roughly
-  (sigma * sqrt(D)) / n_clients, where D is the model's total parameter
-  count. That sqrt(D) term dominates for any real-sized model, and no
-  amount of n_clients dilution among a handful of clients rescues it on
-  its own. Two levers were pulled here to bring the ratio down:
-    1. NUM_CLIENTS raised 3 -> 9 (stronger 1/n_clients dilution). NOTE:
-       this repartitions the same centralized dataset into more slices,
-       it does not add real independent privacy principals -- fine for
-       stress-testing the arithmetic, not a substitute for real
-       additional data owners in a production claim.
-    2. NUM_ROUNDS cut 40 -> 10 with LOCAL_EPOCHS raised 5 -> 20, so total
-       local training work is unchanged but the accountant composes
-       over 4x fewer noisy releases, letting it solve for a much
-       smaller sigma at the same epsilon budget.
-  `dp_preflight_check()` prints the projected ratio before training
-  starts using the model's real D -- read that line first. If it's still
-  high, the next lever (not yet applied here) is protecting fewer
-  parameters with DP -- e.g. only the final classifier head -- rather
-  than the whole model, which directly shrinks D instead of fighting it
-  through n_clients or round count.
-
-Install once: pip install opacus --break-system-packages
+Everything else (model, dataset, overall FL loop, quantization,
+permutation) is unchanged from fl_train.py.
 """
 
 import flwr as fl
@@ -60,13 +54,11 @@ import numpy as np
 import json
 import time
 import warnings
+import zlib
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import seaborn as sns
 import matplotlib.pyplot as plt
-
-from opacus.accountants import RDPAccountant
-from opacus.accountants.utils import get_noise_multiplier
 
 warnings.filterwarnings("ignore")
 
@@ -75,36 +67,67 @@ from util.IMUDataset import IMUDataset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 
-# ====================== PRIVACY (DP) HELPERS ======================
-class dpu:
+def deterministic_hash(name: str) -> int:
+    return zlib.crc32(name.encode("utf-8"))
+
+
+# ====================== PRIVACY (SAPM-Stable) HELPERS ======================
+class pu:
     @staticmethod
-    def flatten(arrays):
-        """Flatten a list of per-tensor numpy arrays into one 1D vector,
-        remembering shapes/sizes so it can be split back apart later."""
-        shapes = [a.shape for a in arrays]
-        sizes = [a.size for a in arrays]
-        flat = np.concatenate([a.reshape(-1) for a in arrays]).astype(np.float64)
-        return flat, shapes, sizes
+    def compute_topk_mask(fisher_flat: np.ndarray, keep_ratio: float) -> np.ndarray:
+        n = fisher_flat.size
+        k = max(1, int(np.ceil(keep_ratio * n)))
+        if k >= n:
+            return np.ones(n, dtype=bool)
+        idx = np.argpartition(fisher_flat, -k)[-k:]
+        mask = np.zeros(n, dtype=bool)
+        mask[idx] = True
+        return mask
 
     @staticmethod
-    def unflatten(flat, shapes, sizes):
-        out = []
-        idx = 0
-        for shape, size in zip(shapes, sizes):
-            out.append(flat[idx: idx + size].reshape(shape))
-            idx += size
-        return out
+    def compute_quant_params(x: np.ndarray):
+        x_min, x_max = float(x.min()), float(x.max())
+        if x_max == x_min:
+            return 1.0, x_min
+        return x_max - x_min, x_min
 
     @staticmethod
-    def clip_by_l2_norm(flat: np.ndarray, clip_norm: float):
-        """Clip a flattened update to max L2 norm `clip_norm`. Returns the
-        (possibly rescaled) vector AND the pre-clip norm, so callers can
-        check whether clip_norm is well-calibrated to real update sizes."""
-        norm = float(np.linalg.norm(flat))
-        if norm > clip_norm and norm > 0:
-            flat = flat * (clip_norm / norm)
-        return flat, norm
+    def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int = 8) -> np.ndarray:
+        if num_bits >= 32:
+            return x.astype(np.float32)
+        qmax = 2 ** num_bits - 1
+        step = scale / qmax if scale != 0 else 1.0
+        x_scaled = (x - zmin) / step
+        floor = np.floor(x_scaled)
+        prob = np.clip(x_scaled - floor, 0.0, 1.0)
+        rnd = np.random.rand(*x.shape)
+        x_q = floor + (rnd < prob)
+        x_q = np.clip(x_q, 0, qmax)
+        return x_q.astype(np.float32)
 
+    @staticmethod
+    def dequantize_with_params(x_q: np.ndarray, scale: float, zmin: float, num_bits: int = 8) -> np.ndarray:
+        if num_bits >= 32:
+            return x_q
+        qmax = 2 ** num_bits - 1
+        step = scale / qmax if scale != 0 else 1.0
+        return x_q * step + zmin
+
+    @staticmethod
+    def permute_pair(idx: np.ndarray, val: np.ndarray, seed: int):
+        # Jointly permutes the compact (indices, values) pair -- length
+        # is nz_count now, not the full tensor size.
+        rng = np.random.RandomState(seed % (2 ** 31 - 1))
+        perm = rng.permutation(idx.size)
+        return idx[perm], val[perm]
+
+    @staticmethod
+    def unpermute_pair(idx: np.ndarray, val: np.ndarray, seed: int):
+        rng = np.random.RandomState(seed % (2 ** 31 - 1))
+        perm = rng.permutation(idx.size)
+        inv = np.empty_like(perm)
+        inv[perm] = np.arange(idx.size)
+        return idx[inv], val[inv]
 
 # ====================== CONFIG ======================
 with open('config.json', 'r') as f:
@@ -115,91 +138,22 @@ torch.manual_seed(42)
 np.random.seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
-NUM_CLIENTS = 9             # up from 3. The 1/n_clients dilution of the
-                             # single noise draw (see docstring) is now
-                             # 3x stronger. NOTE: this repartitions the
-                             # SAME centralized dataset into more slices --
-                             # it does not add real independent data
-                             # owners, so treat it as a stress-test of the
-                             # noise/signal arithmetic, not as adding real
-                             # privacy principals to the guarantee.
-LOCAL_EPOCHS = 20            # up from 5
-NUM_ROUNDS = 10              # down from 40 -- rounds*local_epochs stays
-                             # ~200 either way, so total local training
-                             # work is roughly unchanged. What changes is
-                             # the number of noisy releases the accountant
-                             # has to compose over, which lets it solve
-                             # for a much smaller sigma at the same
-                             # epsilon budget (see printed value below).
+NUM_CLIENTS = 3
+LOCAL_EPOCHS = 5
+NUM_ROUNDS = 40
 
-# ---- differential privacy knobs ----
 USE_PRIVACY = True
-DP_CLIP_NORM = 1.0          # C: max L2 norm of ONE client's delta, taken
-                             # over ALL parameters concatenated. This is
-                             # the sensitivity the accountant relies on.
-                             # DON'T guess this blind -- run one round
-                             # with USE_PRIVACY=False first (or just read
-                             # the printed pre_clip_l2_norm on round 1)
-                             # to see what real update norms look like,
-                             # then set C near the typical/median value.
-                             # Too small -> clipping destroys signal.
-                             # Too large -> noise (which scales with C)
-                             # swamps signal. There's no free lunch here.
-DP_TARGET_EPSILON = 8.0     # total privacy budget for the WHOLE run
-DP_TARGET_DELTA = 1e-5      # should be << 1 / (largest client's dataset size)
+PRIVACY_KEEP_RATIO_START = 0.6   # round 1
+PRIVACY_KEEP_RATIO_END = 0.15    # final round; cosine decay between the two
+PRIVACY_QUANT_BITS = 8
+EWC_LAMBDA = 0.01                # weight on the Fisher-weighted regularizer
 
-# All NUM_CLIENTS participate every round (no random subsampling), so we
-# tell the accountant sample_rate=1.0 -- there's no privacy amplification
-# to claim here. If you later subsample clients per round, set this to
-# the real participation fraction; the required noise for the same
-# epsilon will drop.
-DP_NOISE_MULTIPLIER = get_noise_multiplier(
-    target_epsilon=DP_TARGET_EPSILON,
-    target_delta=DP_TARGET_DELTA,
-    sample_rate=1.0,
-    steps=NUM_ROUNDS,
-    accountant="rdp",
-)
+INDEX_BYTES_PER_ELEMENT = 4  # int32 index actually transmitted now
 
 print(f"Using device: {DEVICE}")
-print(f"Privacy: Gaussian-mechanism DP | enabled={USE_PRIVACY} | "
-      f"clip_norm={DP_CLIP_NORM} | target_epsilon={DP_TARGET_EPSILON} | "
-      f"target_delta={DP_TARGET_DELTA}")
-print(f"[DP] Solved noise_multiplier sigma={DP_NOISE_MULTIPLIER:.4f} for "
-      f"{NUM_ROUNDS} rounds at full ({NUM_CLIENTS}/{NUM_CLIENTS}) participation each round.")
-
-
-def dp_preflight_check(model, noise_multiplier, clip_norm, n_clients):
-    """Prints the projected noise-to-signal ratio BEFORE training starts,
-    using the actual parameter count D of the model being trained. This
-    is what silently blew up last run (round-2 NaNs) -- catching it here
-    costs one forward pass through arithmetic instead of two rounds of
-    wasted GPU time.
-
-    Derivation: a single Gaussian noise draw with per-coordinate std
-    sigma*C is added to the summed clipped deltas, then divided by
-    n_clients. Real signal in the average is at most C (the clip norm).
-    Total noise vector magnitude is ~ sigma*C*sqrt(D). So:
-        noise_to_signal ≈ (sigma * sqrt(D)) / n_clients
-    Ratio << 1 is healthy. Ratio >> 1 means noise will dominate the
-    update and training will not converge (or will NaN out, as before).
-    """
-    D = sum(p.numel() for p in model.parameters())
-    ratio = (noise_multiplier * (D ** 0.5)) / max(1, n_clients)
-    print(f"\n[DP preflight] model has D={D:,} parameters | "
-          f"projected noise-to-signal ratio ≈ {ratio:.2f} "
-          f"(sigma={noise_multiplier:.4f}, clients={n_clients})")
-    if ratio > 5:
-        print(f"[DP preflight] WARNING: ratio is high -- expect degraded "
-              f"or non-converging training. Consider fewer rounds, more "
-              f"clients, a larger epsilon budget, or protecting fewer "
-              f"parameters with DP.")
-    else:
-        print(f"[DP preflight] ratio looks survivable, but this is an "
-              f"estimate (assumes worst-case clipping) -- still watch the "
-              f"per-round pre_clip_l2_norm and accuracy once training starts.")
-    return ratio
-
+print(f"Privacy strategy: SAPM-Stable | enabled={USE_PRIVACY} | "
+      f"keep_ratio {PRIVACY_KEEP_RATIO_START}->{PRIVACY_KEEP_RATIO_END} (cosine) | "
+      f"quant_bits={PRIVACY_QUANT_BITS} | ewc_lambda={EWC_LAMBDA}")
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -240,7 +194,6 @@ def split_train_data(train_dataset, num_clients=NUM_CLIENTS, save_file="client_s
     print("=" * 60)
     return client_datasets
 
-
 # ====================== CLIENT ======================
 class IMUClient(fl.client.NumPyClient):
     def __init__(self, train_subset):
@@ -265,10 +218,22 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_privacy = fit_config.get("use_privacy", USE_PRIVACY)
-        clip_norm = fit_config.get("dp_clip_norm", DP_CLIP_NORM)
+        keep_ratio = fit_config.get("privacy_keep_ratio", PRIVACY_KEEP_RATIO_START)
+        quant_bits = fit_config.get("privacy_quant_bits", PRIVACY_QUANT_BITS)
+        round_seed = fit_config.get("privacy_seed", 0)
+        ewc_lambda = fit_config.get("ewc_lambda", EWC_LAMBDA)
 
         self.model.train()
         total_loss = 0.0
+        total_reg_loss = 0.0
+
+        fisher_accum = {
+            name: torch.zeros_like(p)
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        n_grad_steps = 0
+        fisher_time_sec = 0.0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -277,35 +242,99 @@ class IMUClient(fl.client.NumPyClient):
 
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
-                loss = self.criterion(output, label)
+                ce_loss = self.criterion(output, label)
+
+                # ---- Fisher-weighted regularizer (uses running Fisher
+                # estimate so far this round; zero on the very first
+                # step since there's no estimate yet) ----
+                reg_loss = torch.zeros((), device=DEVICE)
+                if use_privacy and ewc_lambda > 0 and n_grad_steps > 0:
+                    for name, p in self.model.named_parameters():
+                        if name in fisher_accum:
+                            f_running = (fisher_accum[name] / n_grad_steps).detach()
+                            reg_loss = reg_loss + (f_running * (p - old_state[name]) ** 2).sum()
+
+                loss = ce_loss + ewc_lambda * reg_loss
                 loss.backward()
+
+                _fisher_start = time.perf_counter()
+                for name, p in self.model.named_parameters():
+                    if p.grad is not None and name in fisher_accum:
+                        fisher_accum[name] += p.grad.detach() ** 2
+                fisher_time_sec += time.perf_counter() - _fisher_start
+                n_grad_steps += 1
+
                 self.optimizer.step()
-                total_loss += loss.item()
+                total_loss += ce_loss.item()
+                total_reg_loss += float(reg_loss.detach().item())
+
+        for k in fisher_accum:
+            fisher_accum[k] /= max(1, n_grad_steps)
 
         new_state = self.model.state_dict()
-        keys = list(new_state.keys())
-        deltas = [(new_state[k] - old_state[k]).cpu().numpy().astype(np.float32) for k in keys]
-        comm_no_privacy_bytes = sum(d.nbytes for d in deltas)
 
-        if use_privacy:
-            flat, shapes, sizes = dpu.flatten(deltas)
-            flat, pre_clip_norm = dpu.clip_by_l2_norm(flat, clip_norm)
-            out_arrays = [a.astype(np.float32) for a in dpu.unflatten(flat, shapes, sizes)]
-            was_clipped = pre_clip_norm > clip_norm
-        else:
-            out_arrays = deltas
-            full_flat = np.concatenate([d.reshape(-1) for d in deltas])
-            pre_clip_norm = float(np.linalg.norm(full_flat))
-            was_clipped = False
+        out_arrays = []
+        meta = []
+        nz_total, elem_total = 0, 0
 
-        comm_dense_bytes = sum(a.nbytes for a in out_arrays)
+        comm_dense_bytes = 0          # now genuinely what's transmitted
+        comm_sparse_encoded_bytes = 0  # bit-packed lower bound (still hypothetical re: sub-byte packing)
+        comm_no_privacy_bytes = 0
+        transform_time_sec = 0.0
+
+        for name, new_val in new_state.items():
+            old_val = old_state[name]
+            delta = (new_val - old_val).cpu().numpy()
+            comm_no_privacy_bytes += delta.astype(np.float32).nbytes
+
+            if not use_privacy or name not in fisher_accum:
+                out_arrays.append(delta.astype(np.float32))
+                meta.append({"quantized": False, "sparse": False,
+                             "shape": list(delta.shape), "size": int(delta.size)})
+                nz_total += np.count_nonzero(delta)
+                elem_total += delta.size
+                comm_dense_bytes += delta.astype(np.float32).nbytes
+                comm_sparse_encoded_bytes += delta.astype(np.float32).nbytes
+                continue
+
+            _t0 = time.perf_counter()
+            fisher_flat = fisher_accum[name].cpu().numpy().reshape(-1)
+            delta_flat = delta.reshape(-1).astype(np.float32)
+
+            mask = pu.compute_topk_mask(fisher_flat, keep_ratio)
+            idx = np.nonzero(mask)[0].astype(np.int32)
+
+            scale, zmin = pu.compute_quant_params(delta_flat)
+            q_vals = pu.quantize_with_params(delta_flat[idx], scale, zmin, quant_bits).astype(np.float32)
+
+            seed = round_seed * 100003 + deterministic_hash(name) % 97
+            perm_idx, perm_vals = pu.permute_pair(idx, q_vals, seed=seed)
+            transform_time_sec += time.perf_counter() - _t0
+
+            out_arrays.append(perm_idx)
+            out_arrays.append(perm_vals)
+            meta.append({"quantized": True, "sparse": True,
+                         "shape": list(delta.shape), "size": int(delta.size),
+                         "scale": float(scale), "zmin": float(zmin),
+                         "nz_count": int(idx.size)})
+
+            nz_total += idx.size
+            elem_total += delta.size
+
+            comm_dense_bytes += perm_idx.nbytes + perm_vals.astype(np.float32).nbytes
+            value_bytes = max(1, -(-quant_bits // 8))
+            comm_sparse_encoded_bytes += idx.size * (INDEX_BYTES_PER_ELEMENT + value_bytes)
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
-            "pre_clip_l2_norm": pre_clip_norm,   # sanity-check DP_CLIP_NORM against this
-            "was_clipped": float(was_clipped),
+            "avg_reg_loss": total_reg_loss / len(self.train_loader),
+            "nonzero_ratio": float(nz_total / max(1, elem_total)),
+            "privacy_meta": json.dumps(meta),
             "comm_dense_bytes": comm_dense_bytes,
+            "comm_sparse_encoded_bytes": comm_sparse_encoded_bytes,
             "comm_no_privacy_bytes": comm_no_privacy_bytes,
+            "fisher_time_sec": fisher_time_sec,
+            "transform_time_sec": transform_time_sec,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
 
@@ -329,32 +358,46 @@ class IMUClient(fl.client.NumPyClient):
         accuracy = accuracy_score(all_labels, all_preds)
         return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}
 
-
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, use_privacy=USE_PRIVACY,
-                 dp_clip_norm=DP_CLIP_NORM,
-                 dp_noise_multiplier=DP_NOISE_MULTIPLIER,
-                 dp_target_delta=DP_TARGET_DELTA, **kwargs):
+                 keep_ratio_start=PRIVACY_KEEP_RATIO_START,
+                 keep_ratio_end=PRIVACY_KEEP_RATIO_END,
+                 privacy_quant_bits=PRIVACY_QUANT_BITS,
+                 ewc_lambda=EWC_LAMBDA, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
-
         self.use_privacy = use_privacy
-        self.privacy_clip_norm = dp_clip_norm
-        self.privacy_noise_multiplier = dp_noise_multiplier
-        self.privacy_target_delta = dp_target_delta
-        self.privacy_accountant = RDPAccountant()
+        self.keep_ratio_start = keep_ratio_start
+        self.keep_ratio_end = keep_ratio_end
+        self.privacy_quant_bits = privacy_quant_bits
+        self.ewc_lambda = ewc_lambda
 
         self.total_comm_dense_bytes = 0
+        self.total_comm_sparse_encoded_bytes = 0
         self.total_comm_no_privacy_bytes = 0
+        self.total_fisher_time_sec = 0.0
+        self.total_transform_time_sec = 0.0
+        self.total_reconstruct_time_sec = 0.0
+
+    def _keep_ratio_for_round(self, server_round):
+        frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
+        cos = 0.5 * (1 + np.cos(np.pi * frac))  # 1 -> 0 over the run
+        ratio = self.keep_ratio_end + (self.keep_ratio_start - self.keep_ratio_end) * cos
+        return float(ratio)
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
+        keep_ratio = self._keep_ratio_for_round(server_round)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_privacy"] = self.use_privacy
-            fit_ins.config["dp_clip_norm"] = self.privacy_clip_norm
+            fit_ins.config["privacy_keep_ratio"] = keep_ratio
+            fit_ins.config["privacy_quant_bits"] = self.privacy_quant_bits
+            fit_ins.config["privacy_seed"] = server_round
+            fit_ins.config["ewc_lambda"] = self.ewc_lambda
+        self._current_keep_ratio = keep_ratio
         return fit_ins_list
 
     def aggregate_fit(self, server_round, results, failures):
@@ -364,105 +407,117 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         global_state = self.global_model.state_dict()
         keys = list(global_state.keys())
-        shapes = [tuple(global_state[k].shape) for k in keys]
-        sizes = [global_state[k].numel() for k in keys]
+        weighted_deltas = {k: np.zeros(v.shape, dtype=np.float64) for k, v in global_state.items()}
+        total_examples = 0
+        nz_ratios = []
+        reg_losses = []
 
-        summed_flat = None
-        n_clients = 0
         round_comm_dense_bytes = 0
+        round_comm_sparse_encoded_bytes = 0
         round_comm_no_privacy_bytes = 0
-        pre_clip_norms = []
-        clip_count = 0
+        round_fisher_time_sec = []
+        round_transform_time_sec = []
+        round_reconstruct_time_sec = 0.0
 
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
-            flat, _, _ = dpu.flatten(arrays)
-            summed_flat = flat if summed_flat is None else summed_flat + flat
-            n_clients += 1
+            num_examples = fit_res.num_examples
+            meta = json.loads(fit_res.metrics.get("privacy_meta", "[]"))
+            nz_ratios.append(fit_res.metrics.get("nonzero_ratio", 1.0))
+            reg_losses.append(fit_res.metrics.get("avg_reg_loss", 0.0))
 
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
+            round_comm_sparse_encoded_bytes += fit_res.metrics.get("comm_sparse_encoded_bytes", 0)
             round_comm_no_privacy_bytes += fit_res.metrics.get("comm_no_privacy_bytes", 0)
-            pre_clip_norms.append(fit_res.metrics.get("pre_clip_l2_norm", 0.0))
-            clip_count += int(fit_res.metrics.get("was_clipped", 0.0))
+            round_fisher_time_sec.append(fit_res.metrics.get("fisher_time_sec", 0.0))
+            round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
 
-        if self.use_privacy:
-            # Gaussian mechanism, sensitivity = clip_norm (one client's
-            # bounded contribution), applied ONCE to the SUM -- see
-            # module docstring for why this beats per-client noising.
-            noise = np.random.normal(
-                loc=0.0,
-                scale=self.privacy_noise_multiplier * self.privacy_clip_norm,
-                size=summed_flat.shape,
-            )
-            noised_sum = summed_flat + noise
-            self.privacy_accountant.step(
-                noise_multiplier=self.privacy_noise_multiplier, sample_rate=1.0
-            )
-        else:
-            noised_sum = summed_flat
+            _recon_start = time.perf_counter()
+            cursor = 0
+            for k, m in zip(keys, meta):
+                shape = tuple(m["shape"])
+                size = m["size"]
 
-        avg_flat = noised_sum / max(1, n_clients)
+                if not m["sparse"]:
+                    arr = arrays[cursor]; cursor += 1
+                    reconstructed = arr.reshape(shape)
+                else:
+                    idx_arr = arrays[cursor]; cursor += 1
+                    val_arr = arrays[cursor]; cursor += 1
+                    seed = server_round * 100003 + deterministic_hash(k) % 97
+                    idx_unperm, val_unperm = pu.unpermute_pair(idx_arr, val_arr, seed=seed)
+                    dequant = pu.dequantize_with_params(val_unperm, m["scale"], m["zmin"], self.privacy_quant_bits)
+                    dense = np.zeros(size, dtype=np.float32)
+                    dense[idx_unperm] = dequant
+                    reconstructed = dense.reshape(shape)
 
-        if not np.all(np.isfinite(avg_flat)):
-            # Noise (or an upstream NaN already in a client's update)
-            # blew this round up. Applying it would permanently corrupt
-            # the global model for every future round, so skip the
-            # update and keep last round's weights instead of silently
-            # propagating NaN forward.
-            print(f"  [dp] WARNING: round {server_round} produced non-finite "
-                  f"values after noising -- skipping this update, global "
-                  f"model unchanged. Check DP_CLIP_NORM / noise_multiplier.")
-            aggregated_params = ndarrays_to_parameters(
-                [v.cpu().numpy() for v in self.global_model.state_dict().values()]
-            )
-            return aggregated_params, {"accuracy": self.best_acc}
+                weighted_deltas[k] += reconstructed.astype(np.float64) * num_examples
+            round_reconstruct_time_sec += time.perf_counter() - _recon_start
 
-        avg_deltas = dpu.unflatten(avg_flat, shapes, sizes)
+            total_examples += num_examples
 
         new_state = {}
-        for k, delta in zip(keys, avg_deltas):
-            new_state[k] = global_state[k] + torch.tensor(
-                delta, dtype=global_state[k].dtype, device=global_state[k].device
-            )
+        for k in keys:
+            avg_delta = weighted_deltas[k] / max(1, total_examples)
+            new_state[k] = global_state[k] + torch.tensor(avg_delta, dtype=global_state[k].dtype, device=global_state[k].device)
 
         self.global_model.load_state_dict(new_state)
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
 
         acc = self.evaluate_global(final=False)
-        avg_pre_clip_norm = float(np.mean(pre_clip_norms)) if pre_clip_norms else 0.0
+        avg_nz = float(np.mean(nz_ratios)) if nz_ratios else 1.0
+        avg_reg = float(np.mean(reg_losses)) if reg_losses else 0.0
 
         self.total_comm_dense_bytes += round_comm_dense_bytes
+        self.total_comm_sparse_encoded_bytes += round_comm_sparse_encoded_bytes
         self.total_comm_no_privacy_bytes += round_comm_no_privacy_bytes
+        avg_fisher_time = float(np.mean(round_fisher_time_sec)) if round_fisher_time_sec else 0.0
+        avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
+        self.total_fisher_time_sec += avg_fisher_time
+        self.total_transform_time_sec += avg_transform_time
+        self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
-        eps_so_far = (
-            self.privacy_accountant.get_epsilon(self.privacy_target_delta)
-            if self.use_privacy else 0.0
+        compression_vs_no_privacy = (
+            round_comm_dense_bytes / round_comm_no_privacy_bytes
+            if round_comm_no_privacy_bytes else 1.0
         )
-
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f}")
-        print(f"  [dp] avg pre-clip L2 norm: {avg_pre_clip_norm:.4f} "
-              f"(clip_norm={self.privacy_clip_norm}, {clip_count}/{n_clients} clients clipped this round) | "
-              f"cumulative epsilon: {eps_so_far:.3f} / budget {DP_TARGET_EPSILON}")
-        print(f"  [comm] {round_comm_dense_bytes/1e6:.3f} MB sent "
-              f"(no-privacy baseline: {round_comm_no_privacy_bytes/1e6:.3f} MB)")
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | keep_ratio={self._current_keep_ratio:.3f} | "
+              f"Avg transmitted nonzero ratio: {avg_nz:.3f} | avg_reg_loss: {avg_reg:.5f}")
+        print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
+              f"({compression_vs_no_privacy*100:.1f}% of no-privacy baseline: {round_comm_no_privacy_bytes/1e6:.3f} MB) | "
+              f"bit-packed lower bound: {round_comm_sparse_encoded_bytes/1e6:.3f} MB")
+        print(f"  [compute] avg client fisher_time: {avg_fisher_time*1000:.2f}ms | "
+              f"avg client transform_time: {avg_transform_time*1000:.2f}ms | "
+              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
+            torch.save(self.global_model.state_dict(), "best_model_sapm_stable.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
-            final_eps = (
-                self.privacy_accountant.get_epsilon(self.privacy_target_delta)
-                if self.use_privacy else 0.0
-            )
-            print(f"\n[DP] FINAL privacy spent: epsilon={final_eps:.4f} at delta={self.privacy_target_delta} "
-                  f"(target was epsilon={DP_TARGET_EPSILON})")
-            print(f"[comm] Total sent: {self.total_comm_dense_bytes/1e6:.2f} MB "
-                  f"(no-privacy baseline: {self.total_comm_no_privacy_bytes/1e6:.2f} MB)")
+            self.print_overhead_summary()
 
-        return aggregated_params, {"accuracy": acc}
+        return aggregated_params, {
+            "accuracy": acc,
+            "avg_nonzero_ratio": avg_nz,
+            "comm_dense_bytes": round_comm_dense_bytes,
+        }
+
+    def print_overhead_summary(self):
+        print("\n========== OVERHEAD SUMMARY (SAPM-Stable, cumulative over the run) ==========")
+        print(f"Total communication ACTUALLY SENT (sparse, real)  : {self.total_comm_dense_bytes/1e6:.2f} MB")
+        print(f"Total communication with NO privacy (dense baseline): {self.total_comm_no_privacy_bytes/1e6:.2f} MB")
+        if self.total_comm_no_privacy_bytes:
+            print(f"  -> real compression achieved: {self.total_comm_dense_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
+                  f"of no-privacy baseline")
+            print(f"  -> bit-packed lower bound would be {self.total_comm_sparse_encoded_bytes/self.total_comm_no_privacy_bytes*100:.1f}% "
+                  f"of no-privacy baseline (further headroom if values are bit-packed instead of stored as float32)")
+        print(f"Total client-side fisher accumulation time (avg client, summed over rounds): {self.total_fisher_time_sec:.2f}s")
+        print(f"Total client-side transform time (mask+quant+permute, avg client, summed)  : {self.total_transform_time_sec:.2f}s")
+        print(f"Total server-side reconstruct time (unpermute+dequantize+scatter, summed)   : {self.total_reconstruct_time_sec:.2f}s")
+        print(f"Best accuracy achieved: {self.best_acc:.4f}")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
@@ -508,14 +563,13 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (DP)")
+        plt.title("Final Confusion Matrix (SAPM-Stable)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_dp.png")
+        plt.savefig("final_confusion_matrix_sapm_stable.png")
         plt.close()
 
         return accuracy
-
 
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
@@ -523,11 +577,6 @@ def main(train_csv: str, test_csv: str):
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
-
-    if USE_PRIVACY:
-        _probe_model = IMUTransformerEncoder(config).to(DEVICE)
-        dp_preflight_check(_probe_model, DP_NOISE_MULTIPLIER, DP_CLIP_NORM, NUM_CLIENTS)
-        del _probe_model
 
     def client_fn(context):
         if hasattr(context, "node_id"):
@@ -544,9 +593,10 @@ def main(train_csv: str, test_csv: str):
     strategy = SaveModelStrategy(
         test_loader=test_loader,
         use_privacy=USE_PRIVACY,
-        dp_clip_norm=DP_CLIP_NORM,
-        dp_noise_multiplier=DP_NOISE_MULTIPLIER,
-        dp_target_delta=DP_TARGET_DELTA,
+        keep_ratio_start=PRIVACY_KEEP_RATIO_START,
+        keep_ratio_end=PRIVACY_KEEP_RATIO_END,
+        privacy_quant_bits=PRIVACY_QUANT_BITS,
+        ewc_lambda=EWC_LAMBDA,
     )
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
