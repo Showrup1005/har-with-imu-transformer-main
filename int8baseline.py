@@ -25,7 +25,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 60
+NUM_ROUNDS = 40
 
 print(f"Using device: {DEVICE}")
 
@@ -60,45 +60,38 @@ def print_model_size_summary(model):
 
 
 class CommunicationTracker:
+    """Accumulates real transmitted bytes across the whole FL run.
+
+    Upload only: client -> server (parameters returned from fit).
+    Download (server -> client) is intentionally not tracked.
+    """
     def __init__(self):
         self.round_log = []
-        self.total_download_bytes = 0
         self.total_upload_bytes = 0
 
-    def log_round(self, server_round, download_bytes, upload_bytes):
-        self.total_download_bytes += download_bytes
+    def log_round(self, server_round, upload_bytes):
         self.total_upload_bytes += upload_bytes
-        total_round_bytes = download_bytes + upload_bytes
         self.round_log.append({
             "round": server_round,
-            "download_bytes": download_bytes,
             "upload_bytes": upload_bytes,
-            "total_bytes": total_round_bytes,
         })
-        print(f"  [Comm] Round {server_round}: "
-              f"download={download_bytes/1024**2:.2f} MB, "
-              f"upload={upload_bytes/1024**2:.2f} MB, "
-              f"round_total={total_round_bytes/1024**2:.2f} MB")
+        print(f"  [Comm] Round {server_round}: upload={upload_bytes/1024**2:.2f} MB")
 
     def summary(self):
-        total = self.total_download_bytes + self.total_upload_bytes
         print("\n" + "=" * 60)
-        print("COMMUNICATION COST SUMMARY")
+        print("COMMUNICATION COST SUMMARY (UPLOAD ONLY)")
         print("=" * 60)
-        print(f"Total download (server->client):        {self.total_download_bytes/1024**2:.2f} MB")
-        print(f"Total upload   (client->server):         {self.total_upload_bytes/1024**2:.2f} MB   <-- use this for the SAC/FedZip comparison table")
-        print(f"Total round-trip (download + upload):    {total/1024**2:.2f} MB ({total/1024**3:.4f} GB)")
+        print(f"Total upload (client->server): {self.total_upload_bytes/1024**2:.2f} MB "
+              f"({self.total_upload_bytes/1024**3:.4f} GB)")
         if self.round_log:
-            avg_round_upload = self.total_upload_bytes / len(self.round_log)
-            avg_round_total = total / len(self.round_log)
-            print(f"Average upload per round:                {avg_round_upload/1024**2:.2f} MB")
-            print(f"Average round-trip per round:             {avg_round_total/1024**2:.2f} MB")
+            avg_round = self.total_upload_bytes / len(self.round_log)
+            print(f"Average upload per round:       {avg_round/1024**2:.2f} MB")
         print("=" * 60 + "\n")
 
     def save_csv(self, path="communication_log_int8.csv"):
         import csv
         with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["round", "download_bytes", "upload_bytes", "total_bytes"])
+            writer = csv.DictWriter(f, fieldnames=["round", "upload_bytes"])
             writer.writeheader()
             writer.writerows(self.round_log)
         print(f"Communication log saved to {path}")
@@ -107,7 +100,7 @@ class CommunicationTracker:
 comm_tracker = CommunicationTracker()
 
 # ============================================================
-# int8 quantization helpers (per-tensor symmetric scale)
+#  int8 quantization helpers (per-tensor symmetric scale)
 # ============================================================
 def quantize_to_int8(ndarrays):
     """
@@ -128,17 +121,20 @@ def quantize_to_int8(ndarrays):
     """
     quantized = []
     scales = []
-    for arr in ndarrays:
+    for i, arr in enumerate(ndarrays):
         arr = arr.astype(np.float32)
+        if not np.all(np.isfinite(arr)):
+            print(f"WARNING: non-finite values in param tensor {i}, shape {arr.shape}")
         max_abs = np.max(np.abs(arr))
         scale = (max_abs / 127.0) if max_abs > 0 else 1.0
         q = np.round(arr / scale)
+        q = np.nan_to_num(q, nan=0.0, posinf=127.0, neginf=-127.0)  # catch any NaN/inf before cast
         q = np.clip(q, -127, 127).astype(np.int8)
         quantized.append(q)
         scales.append(scale)
 
     scales_arr = np.array(scales, dtype=np.float32)
-    quantized.append(scales_arr)  # carried as the last element of the list
+    quantized.append(scales_arr)
     return quantized
 
 
@@ -211,23 +207,19 @@ class IMUClient(fl.client.NumPyClient):
         else:
             params = parameters
         # whatever arrived on the wire (int8 + scales from server),
-        # dequantize back to fp32 before loading into the model --
+        # dequantize back to fp32 before loading into the model —
         # training must stay in fp32 for stable gradients.
         params = dequantize_from_int8(params)
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
-        # measure download size (server -> this client) exactly as received on the wire
-        download_bytes = compute_ndarrays_size(parameters)
-
         self.set_parameters(parameters)
         self.model.train()
         total_loss = 0.0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
-
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
 
@@ -235,16 +227,17 @@ class IMUClient(fl.client.NumPyClient):
                 output = self.model({"imu": imu})
                 loss = self.criterion(output, label)
                 loss.backward()
+                # Prevents exploding gradients from producing NaN weights.
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
                 self.optimizer.step()
                 total_loss += loss.item()
 
         updated_params = self.get_parameters()  # already int8-quantized
-        # measure upload size (this client -> server) 
         upload_bytes = compute_ndarrays_size(updated_params)
 
         return updated_params, len(self.train_loader.dataset), {
             "train_loss": total_loss / len(self.train_loader),
-            "download_bytes": download_bytes,
             "upload_bytes": upload_bytes,
         }
 
@@ -278,24 +271,32 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
     def configure_fit(self, server_round, parameters, client_manager):
         # quantize the outgoing global model to int8 before it's
-        # distributed to clients (download compression).
+        # distributed to clients.
         ndarrays = parameters_to_ndarrays(parameters)
         quantized_ndarrays = quantize_to_int8(ndarrays)
         quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
         return super().configure_fit(server_round, quantized_parameters, client_manager)
 
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        # Mirror configure_fit: the client's set_parameters() always expects
+        # an int8 payload + trailing scales array, so evaluate parameters
+        # must be quantized the same way fit parameters are, or
+        # dequantize_from_int8 misinterprets a real weight tensor as the
+        # scales array and truncates the state_dict.
+        ndarrays = parameters_to_ndarrays(parameters)
+        quantized_ndarrays = quantize_to_int8(ndarrays)
+        quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
+        return super().configure_evaluate(server_round, quantized_parameters, client_manager)
+
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
 
-        # sum up actual download/upload bytes reported by each client this round
-        # (these already reflect int8+scale wire sizes via compute_ndarrays_size)
-        round_download = 0
+        # sum up actual upload bytes reported by each client this round
+        # (already reflects int8+scale wire size via compute_ndarrays_size)
         round_upload = 0
         for _, fit_res in results:
-            metrics = fit_res.metrics
-            round_download += metrics.get("download_bytes", 0)
-            round_upload += metrics.get("upload_bytes", 0)
-        comm_tracker.log_round(server_round, round_download, round_upload)
+            round_upload += fit_res.metrics.get("upload_bytes", 0)
+        comm_tracker.log_round(server_round, round_upload)
 
         # dequantize each client's returned int8 parameters back to
         # fp32 BEFORE FedAvg's weighted averaging runs. Averaging int8
@@ -400,6 +401,12 @@ def main(train_csv: str, test_csv: str):
 
     _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
     print_model_size_summary(_tmp_model)
+
+    # build genuine fp32 initial parameters here, so Flower never falls
+    # back to asking a client for get_parameters() (which always returns
+    # int8+scales) to seed round 1.
+    initial_ndarrays = [val.cpu().numpy() for _, val in _tmp_model.state_dict().items()]
+    initial_parameters = ndarrays_to_parameters(initial_ndarrays)
     del _tmp_model
 
     def client_fn(context):
@@ -409,12 +416,13 @@ def main(train_csv: str, test_csv: str):
             cid = int(context.node_config["cid"])
         else:
             cid = 0
-
         client_idx = cid % len(client_datasets)
-
         return IMUClient(client_datasets[client_idx]).to_client()
 
-    strategy = SaveModelStrategy(test_loader=test_loader)
+    strategy = SaveModelStrategy(
+        test_loader=test_loader,
+        initial_parameters=initial_parameters,  # passed through **kwargs to FedAvg
+    )
 
     print(f"Starting FL (int8 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 

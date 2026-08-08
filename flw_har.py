@@ -132,11 +132,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 60                   
+NUM_ROUNDS = 50                   
 
 USE_COMPRESSION = True
-COMPRESS_KEEP_RATIO_START = 0.6   # round 1
-COMPRESS_KEEP_RATIO_END = 0.22    
+COMPRESS_KEEP_RATIO_START = 0.4   # round 1
+COMPRESS_KEEP_RATIO_END = 0.2    
 QUANT_BITS = 8
 STABILITY_LAMBDA = 0.01           # weight on the Fisher-weighted stability regularizer
 
