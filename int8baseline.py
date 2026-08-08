@@ -25,12 +25,12 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 60
+NUM_ROUNDS = 40
 
 print(f"Using device: {DEVICE}")
 
 # ============================================================
-#  communication cost measurement utilities
+# communication cost measurement utilities
 # ============================================================
 def compute_ndarrays_size(ndarrays):
     """Total size in bytes of a list of numpy arrays, as they'll actually
@@ -43,6 +43,8 @@ def print_model_size_summary(model):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     size_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
     size_mb = size_bytes / (1024 ** 2)
+    n_tensors = sum(1 for _ in model.parameters())
+    scale_overhead_bytes = n_tensors * 4  # one float32 scale per tensor
 
     print("\n" + "=" * 60)
     print("MODEL SIZE SUMMARY")
@@ -50,13 +52,16 @@ def print_model_size_summary(model):
     print(f"Total parameters:     {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     print(f"Model size (fp32):    {size_bytes:,} bytes = {size_mb:.2f} MB")
+    print(f"Model size (int8):    {size_bytes // 4 + scale_overhead_bytes:,} bytes "
+          f"= {(size_bytes / 4 + scale_overhead_bytes) / (1024**2):.2f} MB  "
+          f"(expected with quantization, incl. {scale_overhead_bytes} bytes scale overhead)")
     print("=" * 60 + "\n")
     return size_bytes
 
 
 class CommunicationTracker:
     def __init__(self):
-        self.round_log = []  # list of dicts per round
+        self.round_log = []
         self.total_download_bytes = 0
         self.total_upload_bytes = 0
 
@@ -90,7 +95,7 @@ class CommunicationTracker:
             print(f"Average round-trip per round:             {avg_round_total/1024**2:.2f} MB")
         print("=" * 60 + "\n")
 
-    def save_csv(self, path="communication_log.csv"):
+    def save_csv(self, path="communication_log_int8.csv"):
         import csv
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["round", "download_bytes", "upload_bytes", "total_bytes"])
@@ -100,6 +105,53 @@ class CommunicationTracker:
 
 
 comm_tracker = CommunicationTracker()
+
+# ============================================================
+# int8 quantization helpers (per-tensor symmetric scale)
+# ============================================================
+def quantize_to_int8(ndarrays):
+    """
+    Per-tensor symmetric quantization: each tensor gets its own scale
+    (max_abs / 127), values mapped to the int8 range [-127, 127].
+
+    Why per-tensor and not a single global scale: parameter tensors in
+    this model span very different magnitude ranges (e.g. LayerNorm
+    weights vs. attention projection weights). A single global scale
+    would waste most of int8's precision on whichever tensor happens to
+    have the largest values, crushing everything else toward zero.
+    Per-tensor scaling costs a few extra bytes (one float32 per tensor)
+    but keeps each tensor's own value range using the full int8 span.
+
+    Returns: quantized int8 arrays + one extra float32 array of scales
+    appended at the end (order matches the input list, since
+    state_dict().items() iterates in a fixed, consistent order).
+    """
+    quantized = []
+    scales = []
+    for arr in ndarrays:
+        arr = arr.astype(np.float32)
+        max_abs = np.max(np.abs(arr))
+        scale = (max_abs / 127.0) if max_abs > 0 else 1.0
+        q = np.round(arr / scale)
+        q = np.clip(q, -127, 127).astype(np.int8)
+        quantized.append(q)
+        scales.append(scale)
+
+    scales_arr = np.array(scales, dtype=np.float32)
+    quantized.append(scales_arr)  # carried as the last element of the list
+    return quantized
+
+
+def dequantize_from_int8(ndarrays):
+    """Reverses quantize_to_int8: last array is the per-tensor scales,
+    everything before it is the quantized int8 tensors in the same order."""
+    scales_arr = ndarrays[-1]
+    quantized = ndarrays[:-1]
+
+    dequantized = []
+    for arr, scale in zip(quantized, scales_arr):
+        dequantized.append(arr.astype(np.float32) * scale)
+    return dequantized
 
 # ====================== DATA ======================
 def load_data(train_csv: str, test_csv: str):
@@ -149,18 +201,24 @@ class IMUClient(fl.client.NumPyClient):
         self.criterion = torch.nn.CrossEntropyLoss()
 
     def get_parameters(self, config=None):
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        # quantize to int8 before this leaves the client (upload compression)
+        fp32_params = [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        return quantize_to_int8(fp32_params)
 
     def set_parameters(self, parameters):
         if hasattr(parameters, "tensors"):
             params = parameters_to_ndarrays(parameters)
         else:
             params = parameters
+        # whatever arrived on the wire (int8 + scales from server),
+        # dequantize back to fp32 before loading into the model --
+        # training must stay in fp32 for stable gradients.
+        params = dequantize_from_int8(params)
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
-        # measure download size (server -> this client) before training
+        # measure download size (server -> this client) exactly as received on the wire
         download_bytes = compute_ndarrays_size(parameters)
 
         self.set_parameters(parameters)
@@ -180,8 +238,8 @@ class IMUClient(fl.client.NumPyClient):
                 self.optimizer.step()
                 total_loss += loss.item()
 
-        updated_params = self.get_parameters()
-        
+        updated_params = self.get_parameters()  # already int8-quantized
+        # measure upload size (this client -> server) 
         upload_bytes = compute_ndarrays_size(updated_params)
 
         return updated_params, len(self.train_loader.dataset), {
@@ -218,10 +276,19 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
 
+    def configure_fit(self, server_round, parameters, client_manager):
+        # quantize the outgoing global model to int8 before it's
+        # distributed to clients (download compression).
+        ndarrays = parameters_to_ndarrays(parameters)
+        quantized_ndarrays = quantize_to_int8(ndarrays)
+        quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
+        return super().configure_fit(server_round, quantized_parameters, client_manager)
+
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
 
         # sum up actual download/upload bytes reported by each client this round
+        # (these already reflect int8+scale wire sizes via compute_ndarrays_size)
         round_download = 0
         round_upload = 0
         for _, fit_res in results:
@@ -229,6 +296,17 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             round_download += metrics.get("download_bytes", 0)
             round_upload += metrics.get("upload_bytes", 0)
         comm_tracker.log_round(server_round, round_download, round_upload)
+
+        # dequantize each client's returned int8 parameters back to
+        # fp32 BEFORE FedAvg's weighted averaging runs. Averaging int8
+        # values directly (or naively averaging without undoing each
+        # client's own per-tensor scale) would produce meaningless
+        # results, since each client may have quantized with a different
+        # scale. Only the WIRE format was int8; aggregation math stays fp32.
+        for _, fit_res in results:
+            ndarrays = parameters_to_ndarrays(fit_res.parameters)
+            ndarrays_fp32 = dequantize_from_int8(ndarrays)
+            fit_res.parameters = ndarrays_to_parameters(ndarrays_fp32)
 
         aggregated = super().aggregate_fit(server_round, results, failures)
 
@@ -250,15 +328,14 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
+            torch.save(self.global_model.state_dict(), "best_model_int8.pth")
 
         # Final evaluation after last round
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
-            # print and save communication summary at the very end
             comm_tracker.summary()
-            comm_tracker.save_csv("communication_log.csv")
+            comm_tracker.save_csv("communication_log_int8.csv")
 
         return aggregated
 
@@ -284,31 +361,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         accuracy = accuracy_score(all_labels, all_preds)
 
-        # During training rounds, return only accuracy
         if not final:
             return accuracy
 
-        # Only after final round
-        precision = precision_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
-
-        recall = recall_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
-
-        f1 = f1_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
+        precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+        recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
 
         print(f"Accuracy : {accuracy:.4f}")
         print(f"Precision: {precision:.4f}")
@@ -325,10 +383,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix")
+        plt.title("Final Confusion Matrix (int8 quantized comm)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix.png")
+        plt.savefig("final_confusion_matrix_int8.png")
         plt.close()
 
         return accuracy
@@ -340,7 +398,6 @@ def main(train_csv: str, test_csv: str):
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    # print model size / theoretical per-round cost before training starts
     _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
     print_model_size_summary(_tmp_model)
     del _tmp_model
@@ -359,7 +416,7 @@ def main(train_csv: str, test_csv: str):
 
     strategy = SaveModelStrategy(test_loader=test_loader)
 
-    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
+    print(f"Starting FL (int8 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
     fl.simulation.start_simulation(
         client_fn=client_fn,

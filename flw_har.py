@@ -19,9 +19,6 @@ principled way:
        - Indices use the narrowest integer dtype that can address
          the tensor (uint16 below 65536 elements, else uint32)
          instead of always int32.
-     comm_dense_bytes now reflects what's *actually* on the wire in
-     these narrow dtypes, so it should land much closer to the old
-     "bit-packed lower bound" line than before.
 
   2. DECAYING KEEP_RATIO SCHEDULE
      keep_ratio starts high (more signal while the model is still
@@ -38,16 +35,8 @@ principled way:
      sensitive to, which matters more as keep_ratio drops and less of
      the update survives transmission -- so the client should spend
      its transmitted "budget" on directions that matter and hold
-     still on the rest. This is an accuracy-preservation mechanism,
-     not a privacy mechanism, and is kept for exactly that reason.
-     NOTE / approximation: the Fisher accumulator is updated from the
-     COMBINED loss gradient (CE + regularizer), not a CE-only
-     gradient, to avoid a second backward pass per step. This mildly
-     contaminates the Fisher signal with the regularizer's own
-     curvature; in practice this effect is small for reasonable
-     STABILITY_LAMBDA and is a deliberate simplicity/cost tradeoff.
+     still on the rest.
 
-Everything else (model, dataset, overall FL loop) is unchanged.
 """
 
 import flwr as fl
@@ -147,17 +136,11 @@ NUM_ROUNDS = 60
 
 USE_COMPRESSION = True
 COMPRESS_KEEP_RATIO_START = 0.6   # round 1
-COMPRESS_KEEP_RATIO_END = 0.22    # was 0.15 -- 0.15 was still starving late-stage fine-tuning
+COMPRESS_KEEP_RATIO_END = 0.22    
 QUANT_BITS = 8
 STABILITY_LAMBDA = 0.01           # weight on the Fisher-weighted stability regularizer
 
-# Tensors at or below this many elements (biases, LayerNorm params, the
-# final classifier head) are sent dense + unquantized every round. They
-# are cheap in absolute bytes no matter what, but disproportionately
-# important for class boundaries -- masking/quantizing them saves
-# almost nothing on the wire while directly hurting accuracy on the
-# hardest, most confusable classes. Everything above this threshold
-# still goes through the full mask+quantize pipeline as before.
+
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096
 
 print(f"Using device: {DEVICE}")
