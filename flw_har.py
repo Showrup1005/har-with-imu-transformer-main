@@ -13,18 +13,11 @@ quantization, but changes what the Fisher score is used FOR:
         sensitivity gets HIGH_BITS (8-bit), everyone else gets
         LOW_BITS (4-bit, nibble-packed two values per byte).
 
-Per-tensor cost: 1 bit/element for a membership bitmask (which group
-each element is in) + high_ratio*HIGH_BITS + (1-high_ratio)*LOW_BITS.
-At high_ratio=0.15, HIGH_BITS=8, LOW_BITS=4: ~5.65 bits/element,
-about 29% smaller than plain dense INT8's 8 bits/element -- while
-never discarding a weight's update entirely, only its precision.
-
-Kept from SAC: the Fisher accumulator (same running estimate, no
-extra backward pass), the Fisher-weighted stability regularizer
-(still relevant here -- low-precision elements are perturbed
-coarsely rather than zeroed, so drift there still matters), the
-small-tensor full-fp32 bypass, and a decaying schedule (this time
-over high_ratio rather than keep_ratio).
+Per-tensor cost: high-precision positions are addressed however is
+cheaper this round -- a flat bitmask (1 bit/element) when high_ratio
+is large, or delta-encoded indices (cheap only when few elements need
+addressing) once high_ratio drops below ~1/index_bits (~0.125 for a
+1-byte delta). 
 """
 
 import flwr as fl
@@ -97,8 +90,26 @@ class mp:
         return out[:n]
 
     @staticmethod
+    def index_dtype_for_max_delta(max_delta: int):
+        if max_delta <= 255:
+            return np.uint8
+        elif max_delta <= 65535:
+            return np.uint16
+        else:
+            return np.uint32
+
+    @staticmethod
     def encode(delta_flat: np.ndarray, fisher_flat: np.ndarray, high_ratio: float,
                high_bits: int = 8, low_bits: int = 4) -> dict:
+        """Adaptive addressing: the high-precision subset's positions are
+        sent either as a bitmask (1 bit/element, flat cost regardless of
+        how few elements are high-precision) or as delta-encoded indices
+        (cheap when few elements are high-precision, expensive when many
+        are). Breakeven is high_ratio ~= 1/index_bits (~0.125 for a
+        1-byte delta) -- below that, addressing directly beats marking
+        every element. Whichever costs fewer real bytes for THIS tensor
+        THIS round is what gets sent; nothing about what's quantized or
+        dropped changes, only how positions are communicated."""
         n = delta_flat.size
         k = max(1, int(np.ceil(high_ratio * n)))
         if k >= n:
@@ -117,20 +128,43 @@ class mp:
         h_q = mp.quantize_with_params(high_vals, h_scale, h_zmin, high_bits).astype(np.uint8)
         l_q = mp.quantize_with_params(low_vals, l_scale, l_zmin, low_bits).astype(np.uint8)
         low_packed = mp.pack_nibbles(l_q)
+
+        # Option A: bitmask
         mask_packed = np.packbits(mask)
 
-        return {
+        # Option B: delta-encoded ascending indices of the high group
+        high_idx_sorted = np.nonzero(mask)[0]  # already ascending
+        deltas = np.diff(np.concatenate(([0], high_idx_sorted)))
+        max_delta = int(deltas.max()) if deltas.size > 0 else 0
+        idx_dtype = mp.index_dtype_for_max_delta(max_delta)
+        idx_deltas = deltas.astype(idx_dtype)
+
+        use_addr = idx_deltas.nbytes < mask_packed.nbytes
+        addr_mode = "addr" if use_addr else "mask"
+
+        payload = {
             "n": n, "n_high": int(high_vals.size), "n_low": int(low_vals.size),
             "h_scale": float(h_scale), "h_zmin": float(h_zmin),
             "l_scale": float(l_scale), "l_zmin": float(l_zmin),
             "high_bits": high_bits, "low_bits": low_bits,
-            "mask_packed": mask_packed, "high_vals": h_q, "low_packed": low_packed,
+            "addr_mode": addr_mode,
+            "high_vals": h_q, "low_packed": low_packed,
         }
+        if use_addr:
+            payload["idx_deltas"] = idx_deltas
+        else:
+            payload["mask_packed"] = mask_packed
+        return payload
 
     @staticmethod
     def decode(payload: dict) -> np.ndarray:
         n = payload["n"]
-        mask = np.unpackbits(payload["mask_packed"])[:n].astype(bool)
+        if payload["addr_mode"] == "addr":
+            positions = np.cumsum(payload["idx_deltas"].astype(np.int64))
+            mask = np.zeros(n, dtype=bool)
+            mask[positions] = True
+        else:
+            mask = np.unpackbits(payload["mask_packed"])[:n].astype(bool)
 
         high_deq = mp.dequantize_with_params(payload["high_vals"], payload["h_scale"],
                                               payload["h_zmin"], payload["high_bits"])
@@ -156,7 +190,7 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 50           # matched to the latest SAC run for comparison
+NUM_ROUNDS = 40         
 
 USE_COMPRESSION = True
 HIGH_RATIO_START = 0.30   # round 1: 30% of each tensor's elements at 8-bit
@@ -304,19 +338,24 @@ class IMUClient(fl.client.NumPyClient):
             payload = mp.encode(delta_flat, fisher_flat, high_ratio, HIGH_BITS, LOW_BITS)
             transform_time_sec += time.perf_counter() - _t0
 
-            out_arrays.append(payload["mask_packed"])
             out_arrays.append(payload["high_vals"])
             out_arrays.append(payload["low_packed"])
+            if payload["addr_mode"] == "addr":
+                out_arrays.append(payload["idx_deltas"])
+            else:
+                out_arrays.append(payload["mask_packed"])
             meta.append({
                 "encoded": True, "shape": list(delta.shape), "size": payload["n"],
                 "n_high": payload["n_high"], "n_low": payload["n_low"],
                 "h_scale": payload["h_scale"], "h_zmin": payload["h_zmin"],
                 "l_scale": payload["l_scale"], "l_zmin": payload["l_zmin"],
                 "high_bits": payload["high_bits"], "low_bits": payload["low_bits"],
+                "addr_mode": payload["addr_mode"],
             })
 
-            comm_dense_bytes += (payload["mask_packed"].nbytes + payload["high_vals"].nbytes
-                                  + payload["low_packed"].nbytes)
+            addr_bytes = (payload["idx_deltas"].nbytes if payload["addr_mode"] == "addr"
+                          else payload["mask_packed"].nbytes)
+            comm_dense_bytes += payload["high_vals"].nbytes + payload["low_packed"].nbytes + addr_bytes
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
@@ -415,16 +454,20 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
                     arr = arrays[cursor]; cursor += 1
                     reconstructed = arr.reshape(shape)
                 else:
-                    mask_packed = arrays[cursor]; cursor += 1
                     high_vals = arrays[cursor]; cursor += 1
                     low_packed = arrays[cursor]; cursor += 1
+                    addr_arr = arrays[cursor]; cursor += 1
                     payload = {
                         "n": m["size"], "n_high": m["n_high"], "n_low": m["n_low"],
                         "h_scale": m["h_scale"], "h_zmin": m["h_zmin"],
                         "l_scale": m["l_scale"], "l_zmin": m["l_zmin"],
                         "high_bits": m["high_bits"], "low_bits": m["low_bits"],
-                        "mask_packed": mask_packed, "high_vals": high_vals, "low_packed": low_packed,
+                        "addr_mode": m["addr_mode"], "high_vals": high_vals, "low_packed": low_packed,
                     }
+                    if m["addr_mode"] == "addr":
+                        payload["idx_deltas"] = addr_arr
+                    else:
+                        payload["mask_packed"] = addr_arr
                     reconstructed = mp.decode(payload).reshape(shape)
 
                 weighted_deltas[k] += reconstructed.astype(np.float64) * num_examples
