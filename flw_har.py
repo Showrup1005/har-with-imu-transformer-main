@@ -1,23 +1,29 @@
 """
-Fisher-Guided Mixed-Precision Compression (FGMP)
+Fisher-Guided Mixed-Precision Compression, v2 (three-tier)
 
-Combines SAC's Fisher-sensitivity scoring with INT8-style dense
-quantization, but changes what the Fisher score is used FOR:
+v1 always sent every element (8-bit for the Fisher-important fraction,
+4-bit for the rest) -- nothing was ever dropped, which protected
+accuracy but capped compression well below FedZip's, since FedZip
+drops ~90% of every tensor to an implicit zero.
 
-  SAC:  Fisher score decides who gets sent at all (top-k). Everyone
-        else is hard-zeroed -- their update is discarded entirely.
-  INT8: everyone gets sent, but at the same 8-bit precision
-        regardless of importance.
-  FGMP: everyone gets sent (nothing is ever zeroed), but Fisher score
-        decides precision: the top `high_ratio` fraction by Fisher
-        sensitivity gets HIGH_BITS (8-bit), everyone else gets
-        LOW_BITS (4-bit, nibble-packed two values per byte).
+v2 adds that third tier back in, but keeps it Fisher-guided rather
+than magnitude-only:
 
-Per-tensor cost: high-precision positions are addressed however is
-cheaper this round -- a flat bitmask (1 bit/element) when high_ratio
-is large, or delta-encoded indices (cheap only when few elements need
-addressing) once high_ratio drops below ~1/index_bits (~0.125 for a
-1-byte delta). 
+  DROP  (bottom 1-keep_ratio by Fisher):  sent as nothing, implicit 0
+  LOW   (next slice of what's kept):      4-bit
+  HIGH  (top slice of what's kept):       8-bit
+
+keep_ratio decays 0.35->0.15 across the run -- the same order of
+aggressiveness as FedZip's static top_z=0.1 -- so total compression
+should land in the same ballpark. What should differ from FedZip:
+(a) the schedule starts generous and only tightens as training
+progresses, rather than being maximally aggressive from round 1, and
+(b) even within "kept", a further Fisher-guided split protects the
+most sensitive weights at full 8-bit precision instead of collapsing
+everything kept into a single quantization level. Positions are
+addressed however is cheaper each round -- bitmask vs delta-index for
+the kept set, plus a small submask (over just the kept set, not the
+whole tensor) for which kept elements are high-vs-low.
 """
 
 import flwr as fl
@@ -99,56 +105,67 @@ class mp:
             return np.uint32
 
     @staticmethod
-    def encode(delta_flat: np.ndarray, fisher_flat: np.ndarray, high_ratio: float,
-               high_bits: int = 8, low_bits: int = 4) -> dict:
-        """Adaptive addressing: the high-precision subset's positions are
-        sent either as a bitmask (1 bit/element, flat cost regardless of
-        how few elements are high-precision) or as delta-encoded indices
-        (cheap when few elements are high-precision, expensive when many
-        are). Breakeven is high_ratio ~= 1/index_bits (~0.125 for a
-        1-byte delta) -- below that, addressing directly beats marking
-        every element. Whichever costs fewer real bytes for THIS tensor
-        THIS round is what gets sent; nothing about what's quantized or
-        dropped changes, only how positions are communicated."""
+    def encode(delta_flat: np.ndarray, fisher_flat: np.ndarray, keep_ratio: float,
+               high_frac_of_kept: float, high_bits: int = 8, low_bits: int = 4) -> dict:
+        """Three tiers now, not two: the bottom `1-keep_ratio` fraction
+        by Fisher sensitivity is DROPPED entirely (implicit zero, like
+        SAC/FedZip's majority cluster -- costs nothing). Of what's kept,
+        the top `high_frac_of_kept` fraction gets HIGH_BITS, the rest
+        gets LOW_BITS. Positions of the kept set are addressed however
+        is cheaper this round (bitmask vs delta-index, same adaptive
+        choice as before); which kept positions are high-vs-low is a
+        second, much smaller submask (only k_keep bits, not n bits)."""
         n = delta_flat.size
-        k = max(1, int(np.ceil(high_ratio * n)))
-        if k >= n:
-            mask = np.ones(n, dtype=bool)
+        k_keep = max(1, int(np.ceil(keep_ratio * n)))
+        if k_keep >= n:
+            keep_positions = np.arange(n)
         else:
-            idx_high = np.argpartition(fisher_flat, -k)[-k:]
-            mask = np.zeros(n, dtype=bool)
-            mask[idx_high] = True
+            idx_keep = np.argpartition(fisher_flat, -k_keep)[-k_keep:]
+            keep_positions = np.sort(idx_keep)
 
-        high_vals = delta_flat[mask]
-        low_vals = delta_flat[~mask]
+        fisher_kept = fisher_flat[keep_positions]
+        k_high = max(1, int(round(high_frac_of_kept * keep_positions.size)))
+        if k_high >= keep_positions.size:
+            high_local = np.ones(keep_positions.size, dtype=bool)
+        else:
+            idx_high_local = np.argpartition(fisher_kept, -k_high)[-k_high:]
+            high_local = np.zeros(keep_positions.size, dtype=bool)
+            high_local[idx_high_local] = True
+
+        high_positions = keep_positions[high_local]
+        low_positions = keep_positions[~high_local]
+        high_vals = delta_flat[high_positions]
+        low_vals = delta_flat[low_positions]
 
         h_scale, h_zmin = mp.compute_quant_params(high_vals)
         l_scale, l_zmin = mp.compute_quant_params(low_vals)
-
         h_q = mp.quantize_with_params(high_vals, h_scale, h_zmin, high_bits).astype(np.uint8)
         l_q = mp.quantize_with_params(low_vals, l_scale, l_zmin, low_bits).astype(np.uint8)
         low_packed = mp.pack_nibbles(l_q)
+        # submask over the KEPT set only (ascending order, aligned with
+        # keep_positions) -- k_keep bits, not n bits.
+        submask_packed = np.packbits(high_local)
 
-        # Option A: bitmask
-        mask_packed = np.packbits(mask)
-
-        # Option B: delta-encoded ascending indices of the high group
-        high_idx_sorted = np.nonzero(mask)[0]  # already ascending
-        deltas = np.diff(np.concatenate(([0], high_idx_sorted)))
+        # Address the kept set within the full tensor: bitmask (n bits)
+        # vs delta-index (k_keep deltas) -- pick whichever is smaller.
+        mask_full = np.zeros(n, dtype=bool)
+        mask_full[keep_positions] = True
+        mask_packed = np.packbits(mask_full)
+        deltas = np.diff(np.concatenate(([0], keep_positions)))
         max_delta = int(deltas.max()) if deltas.size > 0 else 0
         idx_dtype = mp.index_dtype_for_max_delta(max_delta)
         idx_deltas = deltas.astype(idx_dtype)
-
         use_addr = idx_deltas.nbytes < mask_packed.nbytes
         addr_mode = "addr" if use_addr else "mask"
 
         payload = {
-            "n": n, "n_high": int(high_vals.size), "n_low": int(low_vals.size),
+            "n": n, "n_keep": int(keep_positions.size),
+            "n_high": int(high_vals.size), "n_low": int(low_vals.size),
             "h_scale": float(h_scale), "h_zmin": float(h_zmin),
             "l_scale": float(l_scale), "l_zmin": float(l_zmin),
             "high_bits": high_bits, "low_bits": low_bits,
             "addr_mode": addr_mode,
-            "high_vals": h_q, "low_packed": low_packed,
+            "high_vals": h_q, "low_packed": low_packed, "submask_packed": submask_packed,
         }
         if use_addr:
             payload["idx_deltas"] = idx_deltas
@@ -160,11 +177,13 @@ class mp:
     def decode(payload: dict) -> np.ndarray:
         n = payload["n"]
         if payload["addr_mode"] == "addr":
-            positions = np.cumsum(payload["idx_deltas"].astype(np.int64))
-            mask = np.zeros(n, dtype=bool)
-            mask[positions] = True
+            keep_positions = np.cumsum(payload["idx_deltas"].astype(np.int64))
         else:
-            mask = np.unpackbits(payload["mask_packed"])[:n].astype(bool)
+            keep_positions = np.nonzero(np.unpackbits(payload["mask_packed"])[:n])[0]
+
+        high_local = np.unpackbits(payload["submask_packed"])[:payload["n_keep"]].astype(bool)
+        high_positions = keep_positions[high_local]
+        low_positions = keep_positions[~high_local]
 
         high_deq = mp.dequantize_with_params(payload["high_vals"], payload["h_scale"],
                                               payload["h_zmin"], payload["high_bits"])
@@ -172,9 +191,9 @@ class mp:
         low_deq = mp.dequantize_with_params(low_q, payload["l_scale"],
                                              payload["l_zmin"], payload["low_bits"])
 
-        dense = np.empty(n, dtype=np.float32)
-        dense[mask] = high_deq
-        dense[~mask] = low_deq
+        dense = np.zeros(n, dtype=np.float32)   # everything not kept is implicitly zero
+        dense[high_positions] = high_deq
+        dense[low_positions] = low_deq
         return dense
 
 
@@ -190,20 +209,22 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40         
+NUM_ROUNDS = 40           
 
 USE_COMPRESSION = True
-HIGH_RATIO_START = 0.30   # round 1: 30% of each tensor's elements at 8-bit
-HIGH_RATIO_END = 0.10     # final round: 10% at 8-bit, 90% at 4-bit -- never 0% anywhere
+KEEP_RATIO_START = 0.35   # round 1: keep top 35% of each tensor by Fisher, drop the rest to 0
+KEEP_RATIO_END = 0.15     # final round: keep only top 15% 
+HIGH_FRAC_OF_KEPT = 0.30  # of what's KEPT, the top 30% (by Fisher) gets 8-bit, the rest gets 4-bit
 HIGH_BITS = 8
 LOW_BITS = 4
 STABILITY_LAMBDA = 0.01
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # same rationale as SAC: cheap tensors sent dense fp32
 
 print(f"Using device: {DEVICE}")
-print(f"Compression strategy: FGMP | enabled={USE_COMPRESSION} | "
-      f"high_ratio {HIGH_RATIO_START}->{HIGH_RATIO_END} (cosine) | "
-      f"high_bits={HIGH_BITS} low_bits={LOW_BITS} | stability_lambda={STABILITY_LAMBDA}")
+print(f"Compression strategy: FGMP-v2 (3-tier) | enabled={USE_COMPRESSION} | "
+      f"keep_ratio {KEEP_RATIO_START}->{KEEP_RATIO_END} (cosine) | "
+      f"high_frac_of_kept={HIGH_FRAC_OF_KEPT} | high_bits={HIGH_BITS} low_bits={LOW_BITS} | "
+      f"stability_lambda={STABILITY_LAMBDA}")
 
 
 # ====================== DATA ======================
@@ -264,7 +285,7 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_compression = fit_config.get("use_compression", USE_COMPRESSION)
-        high_ratio = fit_config.get("high_ratio", HIGH_RATIO_START)
+        keep_ratio = fit_config.get("keep_ratio", KEEP_RATIO_START)
         stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
 
         self.model.train()
@@ -335,18 +356,19 @@ class IMUClient(fl.client.NumPyClient):
             _t0 = time.perf_counter()
             fisher_flat = fisher_accum[name].cpu().numpy().reshape(-1)
             delta_flat = delta.reshape(-1).astype(np.float32)
-            payload = mp.encode(delta_flat, fisher_flat, high_ratio, HIGH_BITS, LOW_BITS)
+            payload = mp.encode(delta_flat, fisher_flat, keep_ratio, HIGH_FRAC_OF_KEPT, HIGH_BITS, LOW_BITS)
             transform_time_sec += time.perf_counter() - _t0
 
             out_arrays.append(payload["high_vals"])
             out_arrays.append(payload["low_packed"])
+            out_arrays.append(payload["submask_packed"])
             if payload["addr_mode"] == "addr":
                 out_arrays.append(payload["idx_deltas"])
             else:
                 out_arrays.append(payload["mask_packed"])
             meta.append({
                 "encoded": True, "shape": list(delta.shape), "size": payload["n"],
-                "n_high": payload["n_high"], "n_low": payload["n_low"],
+                "n_keep": payload["n_keep"], "n_high": payload["n_high"], "n_low": payload["n_low"],
                 "h_scale": payload["h_scale"], "h_zmin": payload["h_zmin"],
                 "l_scale": payload["l_scale"], "l_zmin": payload["l_zmin"],
                 "high_bits": payload["high_bits"], "low_bits": payload["low_bits"],
@@ -355,7 +377,8 @@ class IMUClient(fl.client.NumPyClient):
 
             addr_bytes = (payload["idx_deltas"].nbytes if payload["addr_mode"] == "addr"
                           else payload["mask_packed"].nbytes)
-            comm_dense_bytes += payload["high_vals"].nbytes + payload["low_packed"].nbytes + addr_bytes
+            comm_dense_bytes += (payload["high_vals"].nbytes + payload["low_packed"].nbytes
+                                  + payload["submask_packed"].nbytes + addr_bytes)
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
@@ -387,15 +410,15 @@ class IMUClient(fl.client.NumPyClient):
 # ====================== STRATEGY ======================
 class FGMPStrategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, use_compression=USE_COMPRESSION,
-                 high_ratio_start=HIGH_RATIO_START, high_ratio_end=HIGH_RATIO_END,
+                 keep_ratio_start=KEEP_RATIO_START, keep_ratio_end=KEEP_RATIO_END,
                  stability_lambda=STABILITY_LAMBDA, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
         self.use_compression = use_compression
-        self.high_ratio_start = high_ratio_start
-        self.high_ratio_end = high_ratio_end
+        self.keep_ratio_start = keep_ratio_start
+        self.keep_ratio_end = keep_ratio_end
         self.stability_lambda = stability_lambda
 
         self.total_comm_dense_bytes = 0
@@ -404,19 +427,19 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
         self.total_transform_time_sec = 0.0
         self.total_reconstruct_time_sec = 0.0
 
-    def _high_ratio_for_round(self, server_round):
+    def _keep_ratio_for_round(self, server_round):
         frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
         cos = 0.5 * (1 + np.cos(np.pi * frac))
-        return float(self.high_ratio_end + (self.high_ratio_start - self.high_ratio_end) * cos)
+        return float(self.keep_ratio_end + (self.keep_ratio_start - self.keep_ratio_end) * cos)
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
-        high_ratio = self._high_ratio_for_round(server_round)
+        keep_ratio = self._keep_ratio_for_round(server_round)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_compression"] = self.use_compression
-            fit_ins.config["high_ratio"] = high_ratio
+            fit_ins.config["keep_ratio"] = keep_ratio
             fit_ins.config["stability_lambda"] = self.stability_lambda
-        self._current_high_ratio = high_ratio
+        self._current_keep_ratio = keep_ratio
         return fit_ins_list
 
     def aggregate_fit(self, server_round, results, failures):
@@ -456,13 +479,15 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
                 else:
                     high_vals = arrays[cursor]; cursor += 1
                     low_packed = arrays[cursor]; cursor += 1
+                    submask_packed = arrays[cursor]; cursor += 1
                     addr_arr = arrays[cursor]; cursor += 1
                     payload = {
-                        "n": m["size"], "n_high": m["n_high"], "n_low": m["n_low"],
+                        "n": m["size"], "n_keep": m["n_keep"], "n_high": m["n_high"], "n_low": m["n_low"],
                         "h_scale": m["h_scale"], "h_zmin": m["h_zmin"],
                         "l_scale": m["l_scale"], "l_zmin": m["l_zmin"],
                         "high_bits": m["high_bits"], "low_bits": m["low_bits"],
-                        "addr_mode": m["addr_mode"], "high_vals": high_vals, "low_packed": low_packed,
+                        "addr_mode": m["addr_mode"], "high_vals": high_vals,
+                        "low_packed": low_packed, "submask_packed": submask_packed,
                     }
                     if m["addr_mode"] == "addr":
                         payload["idx_deltas"] = addr_arr
@@ -497,7 +522,7 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
             round_comm_dense_bytes / round_comm_no_compression_bytes
             if round_comm_no_compression_bytes else 1.0
         )
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | high_ratio={self._current_high_ratio:.3f} | "
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | keep_ratio={self._current_keep_ratio:.3f} | "
               f"avg_reg_loss: {avg_reg:.5f}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
@@ -589,8 +614,8 @@ def main(train_csv: str, test_csv: str):
     strategy = FGMPStrategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
-        high_ratio_start=HIGH_RATIO_START,
-        high_ratio_end=HIGH_RATIO_END,
+        keep_ratio_start=KEEP_RATIO_START,
+        keep_ratio_end=KEEP_RATIO_END,
         stability_lambda=STABILITY_LAMBDA,
     )
 
