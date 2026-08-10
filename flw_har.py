@@ -1,29 +1,5 @@
 """
-Fisher-Guided Mixed-Precision Compression, v2 (three-tier)
-
-v1 always sent every element (8-bit for the Fisher-important fraction,
-4-bit for the rest) -- nothing was ever dropped, which protected
-accuracy but capped compression well below FedZip's, since FedZip
-drops ~90% of every tensor to an implicit zero.
-
-v2 adds that third tier back in, but keeps it Fisher-guided rather
-than magnitude-only:
-
-  DROP  (bottom 1-keep_ratio by Fisher):  sent as nothing, implicit 0
-  LOW   (next slice of what's kept):      4-bit
-  HIGH  (top slice of what's kept):       8-bit
-
-keep_ratio decays 0.35->0.15 across the run -- the same order of
-aggressiveness as FedZip's static top_z=0.1 -- so total compression
-should land in the same ballpark. What should differ from FedZip:
-(a) the schedule starts generous and only tightens as training
-progresses, rather than being maximally aggressive from round 1, and
-(b) even within "kept", a further Fisher-guided split protects the
-most sensitive weights at full 8-bit precision instead of collapsing
-everything kept into a single quantization level. Positions are
-addressed however is cheaper each round -- bitmask vs delta-index for
-the kept set, plus a small submask (over just the kept set, not the
-whole tensor) for which kept elements are high-vs-low.
+Fisher-Guided Mixed-Precision Compression (no-drop, uniform quant)
 """
 
 import flwr as fl
@@ -44,7 +20,7 @@ from util.IMUDataset import IMUDataset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
 
 
-# ====================== MIXED-PRECISION HELPERS ======================
+# ====================== UNIFORM-PRECISION QUANT HELPERS ======================
 class mp:
     @staticmethod
     def compute_quant_params(x: np.ndarray):
@@ -57,9 +33,9 @@ class mp:
 
     @staticmethod
     def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int) -> np.ndarray:
-        """Stochastic-rounding quantization, same as SAC's -- unbiased
-        in expectation, which matters more here since the low-precision
-        group only gets 4 bits."""
+        """Stochastic-rounding quantization -- unbiased in expectation, which
+        matters more here since we're now quantizing every single element
+        (no high-precision safety net for a protected subset)."""
         if x.size == 0:
             return x.astype(np.float32)
         qmax = 2 ** num_bits - 1
@@ -69,7 +45,7 @@ class mp:
         prob = np.clip(x_scaled - floor, 0.0, 1.0)
         rnd = np.random.rand(*x.shape)
         x_q = floor + (rnd < prob)
-        return np.clip(x_q, 0, qmax).astype(np.float32)
+        return np.clip(x_q, 0, qmax).astype(np.float64)
 
     @staticmethod
     def dequantize_with_params(x_q: np.ndarray, scale: float, zmin: float, num_bits: int) -> np.ndarray:
@@ -78,123 +54,36 @@ class mp:
         return x_q.astype(np.float32) * step + zmin
 
     @staticmethod
-    def pack_nibbles(values_0to15: np.ndarray) -> np.ndarray:
-        """Two 4-bit codes per byte. Pads with a zero if odd length."""
-        v = values_0to15.astype(np.uint8)
-        if v.size % 2 == 1:
-            v = np.concatenate([v, [0]])
-        pairs = v.reshape(-1, 2)
-        return ((pairs[:, 0] & 0x0F) | ((pairs[:, 1] & 0x0F) << 4)).astype(np.uint8)
+    def pack_bits(values: np.ndarray, nbits: int) -> np.ndarray:
+        """Generic sub-byte bit-packer -- any width 1..8, not just nibbles."""
+        v = values.astype(np.uint32)
+        bit_planes = ((v[:, None] >> np.arange(nbits - 1, -1, -1)) & 1).astype(np.uint8)
+        return np.packbits(bit_planes.reshape(-1))
 
     @staticmethod
-    def unpack_nibbles(packed: np.ndarray, n: int) -> np.ndarray:
-        lo = packed & 0x0F
-        hi = (packed >> 4) & 0x0F
-        out = np.empty(packed.size * 2, dtype=np.uint8)
-        out[0::2] = lo
-        out[1::2] = hi
-        return out[:n]
+    def unpack_bits(packed: np.ndarray, n: int, nbits: int) -> np.ndarray:
+        total_bits = n * nbits
+        bits = np.unpackbits(packed)[:total_bits].reshape(n, nbits)
+        weights = (1 << np.arange(nbits - 1, -1, -1)).astype(np.uint32)
+        return (bits * weights).sum(axis=1).astype(np.uint32)
 
     @staticmethod
-    def index_dtype_for_max_delta(max_delta: int):
-        if max_delta <= 255:
-            return np.uint8
-        elif max_delta <= 65535:
-            return np.uint16
-        else:
-            return np.uint32
-
-    @staticmethod
-    def encode(delta_flat: np.ndarray, fisher_flat: np.ndarray, keep_ratio: float,
-               high_frac_of_kept: float, high_bits: int = 8, low_bits: int = 4) -> dict:
-        """Three tiers now, not two: the bottom `1-keep_ratio` fraction
-        by Fisher sensitivity is DROPPED entirely (implicit zero, like
-        SAC/FedZip's majority cluster -- costs nothing). Of what's kept,
-        the top `high_frac_of_kept` fraction gets HIGH_BITS, the rest
-        gets LOW_BITS. Positions of the kept set are addressed however
-        is cheaper this round (bitmask vs delta-index, same adaptive
-        choice as before); which kept positions are high-vs-low is a
-        second, much smaller submask (only k_keep bits, not n bits)."""
+    def encode(delta_flat: np.ndarray, num_bits: int) -> dict:
+        """No selection, no dropping: every element goes through the same
+        num_bits quantizer. No mask/addr/submask needed -- decoder knows the
+        shape already, so 'which positions' is just 'all of them, in order'."""
         n = delta_flat.size
-        k_keep = max(1, int(np.ceil(keep_ratio * n)))
-        if k_keep >= n:
-            keep_positions = np.arange(n)
-        else:
-            idx_keep = np.argpartition(fisher_flat, -k_keep)[-k_keep:]
-            keep_positions = np.sort(idx_keep)
-
-        fisher_kept = fisher_flat[keep_positions]
-        k_high = max(1, int(round(high_frac_of_kept * keep_positions.size)))
-        if k_high >= keep_positions.size:
-            high_local = np.ones(keep_positions.size, dtype=bool)
-        else:
-            idx_high_local = np.argpartition(fisher_kept, -k_high)[-k_high:]
-            high_local = np.zeros(keep_positions.size, dtype=bool)
-            high_local[idx_high_local] = True
-
-        high_positions = keep_positions[high_local]
-        low_positions = keep_positions[~high_local]
-        high_vals = delta_flat[high_positions]
-        low_vals = delta_flat[low_positions]
-
-        h_scale, h_zmin = mp.compute_quant_params(high_vals)
-        l_scale, l_zmin = mp.compute_quant_params(low_vals)
-        h_q = mp.quantize_with_params(high_vals, h_scale, h_zmin, high_bits).astype(np.uint8)
-        l_q = mp.quantize_with_params(low_vals, l_scale, l_zmin, low_bits).astype(np.uint8)
-        low_packed = mp.pack_nibbles(l_q)
-        # submask over the KEPT set only (ascending order, aligned with
-        # keep_positions) -- k_keep bits, not n bits.
-        submask_packed = np.packbits(high_local)
-
-        # Address the kept set within the full tensor: bitmask (n bits)
-        # vs delta-index (k_keep deltas) -- pick whichever is smaller.
-        mask_full = np.zeros(n, dtype=bool)
-        mask_full[keep_positions] = True
-        mask_packed = np.packbits(mask_full)
-        deltas = np.diff(np.concatenate(([0], keep_positions)))
-        max_delta = int(deltas.max()) if deltas.size > 0 else 0
-        idx_dtype = mp.index_dtype_for_max_delta(max_delta)
-        idx_deltas = deltas.astype(idx_dtype)
-        use_addr = idx_deltas.nbytes < mask_packed.nbytes
-        addr_mode = "addr" if use_addr else "mask"
-
-        payload = {
-            "n": n, "n_keep": int(keep_positions.size),
-            "n_high": int(high_vals.size), "n_low": int(low_vals.size),
-            "h_scale": float(h_scale), "h_zmin": float(h_zmin),
-            "l_scale": float(l_scale), "l_zmin": float(l_zmin),
-            "high_bits": high_bits, "low_bits": low_bits,
-            "addr_mode": addr_mode,
-            "high_vals": h_q, "low_packed": low_packed, "submask_packed": submask_packed,
-        }
-        if use_addr:
-            payload["idx_deltas"] = idx_deltas
-        else:
-            payload["mask_packed"] = mask_packed
-        return payload
+        scale, zmin = mp.compute_quant_params(delta_flat)
+        q = mp.quantize_with_params(delta_flat, scale, zmin, num_bits).astype(np.uint32)
+        packed = mp.pack_bits(q, num_bits)
+        return {"n": n, "num_bits": num_bits, "scale": float(scale), "zmin": float(zmin), "packed": packed}
 
     @staticmethod
     def decode(payload: dict) -> np.ndarray:
         n = payload["n"]
-        if payload["addr_mode"] == "addr":
-            keep_positions = np.cumsum(payload["idx_deltas"].astype(np.int64))
-        else:
-            keep_positions = np.nonzero(np.unpackbits(payload["mask_packed"])[:n])[0]
-
-        high_local = np.unpackbits(payload["submask_packed"])[:payload["n_keep"]].astype(bool)
-        high_positions = keep_positions[high_local]
-        low_positions = keep_positions[~high_local]
-
-        high_deq = mp.dequantize_with_params(payload["high_vals"], payload["h_scale"],
-                                              payload["h_zmin"], payload["high_bits"])
-        low_q = mp.unpack_nibbles(payload["low_packed"], payload["n_low"])
-        low_deq = mp.dequantize_with_params(low_q, payload["l_scale"],
-                                             payload["l_zmin"], payload["low_bits"])
-
-        dense = np.zeros(n, dtype=np.float32)   # everything not kept is implicitly zero
-        dense[high_positions] = high_deq
-        dense[low_positions] = low_deq
-        return dense
+        nbits = payload["num_bits"]
+        q = mp.unpack_bits(payload["packed"], n, nbits)
+        return mp.dequantize_with_params(q, payload["scale"], payload["zmin"], nbits)
 
 
 # ====================== CONFIG ======================
@@ -209,22 +98,18 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40           
+NUM_ROUNDS = 40
 
 USE_COMPRESSION = True
-KEEP_RATIO_START = 0.35   # round 1: keep top 35% of each tensor by Fisher, drop the rest to 0
-KEEP_RATIO_END = 0.15     # final round: keep only top 15% 
-HIGH_FRAC_OF_KEPT = 0.30  # of what's KEPT, the top 30% (by Fisher) gets 8-bit, the rest gets 4-bit
-HIGH_BITS = 8
-LOW_BITS = 4
+NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
+NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
 STABILITY_LAMBDA = 0.01
-SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # same rationale as SAC: cheap tensors sent dense fp32
+SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
-print(f"Compression strategy: FGMP-v2 (3-tier) | enabled={USE_COMPRESSION} | "
-      f"keep_ratio {KEEP_RATIO_START}->{KEEP_RATIO_END} (cosine) | "
-      f"high_frac_of_kept={HIGH_FRAC_OF_KEPT} | high_bits={HIGH_BITS} low_bits={LOW_BITS} | "
-      f"stability_lambda={STABILITY_LAMBDA}")
+print(f"Compression strategy: FGMP-v3 (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
+      f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
+      f"keep_ratio=1.0 always | stability_lambda={STABILITY_LAMBDA}")
 
 
 # ====================== DATA ======================
@@ -285,20 +170,22 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_compression = fit_config.get("use_compression", USE_COMPRESSION)
-        keep_ratio = fit_config.get("keep_ratio", KEEP_RATIO_START)
+        num_bits = int(fit_config.get("num_bits", NUM_BITS_START))
         stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
 
         self.model.train()
         total_loss = 0.0
         total_reg_loss = 0.0
 
+        # Fisher is kept ONLY for the stability regularizer now -- it no
+        # longer decides who gets dropped or who gets high/low precision,
+        # since nobody is dropped and there's no tier to assign.
         fisher_accum = {
             name: torch.zeros_like(p)
             for name, p in self.model.named_parameters()
             if p.requires_grad
         }
         n_grad_steps = 0
-        fisher_time_sec = 0.0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -319,19 +206,14 @@ class IMUClient(fl.client.NumPyClient):
                 loss = ce_loss + stability_lambda * reg_loss
                 loss.backward()
 
-                _fisher_start = time.perf_counter()
                 for name, p in self.model.named_parameters():
                     if p.grad is not None and name in fisher_accum:
                         fisher_accum[name] += p.grad.detach() ** 2
-                fisher_time_sec += time.perf_counter() - _fisher_start
                 n_grad_steps += 1
 
                 self.optimizer.step()
                 total_loss += ce_loss.item()
                 total_reg_loss += float(reg_loss.detach().item())
-
-        for k in fisher_accum:
-            fisher_accum[k] /= max(1, n_grad_steps)
 
         new_state = self.model.state_dict()
 
@@ -346,39 +228,23 @@ class IMUClient(fl.client.NumPyClient):
             delta = (new_val - old_val).cpu().numpy()
             comm_no_compression_bytes += delta.astype(np.float32).nbytes
 
-            if (not use_compression or name not in fisher_accum
-                    or delta.size <= SMALL_TENSOR_FULL_SEND_THRESHOLD):
+            if (not use_compression or delta.size <= SMALL_TENSOR_FULL_SEND_THRESHOLD):
                 out_arrays.append(delta.astype(np.float32))
                 meta.append({"encoded": False, "shape": list(delta.shape), "size": int(delta.size)})
                 comm_dense_bytes += delta.astype(np.float32).nbytes
                 continue
 
             _t0 = time.perf_counter()
-            fisher_flat = fisher_accum[name].cpu().numpy().reshape(-1)
             delta_flat = delta.reshape(-1).astype(np.float32)
-            payload = mp.encode(delta_flat, fisher_flat, keep_ratio, HIGH_FRAC_OF_KEPT, HIGH_BITS, LOW_BITS)
+            payload = mp.encode(delta_flat, num_bits)
             transform_time_sec += time.perf_counter() - _t0
 
-            out_arrays.append(payload["high_vals"])
-            out_arrays.append(payload["low_packed"])
-            out_arrays.append(payload["submask_packed"])
-            if payload["addr_mode"] == "addr":
-                out_arrays.append(payload["idx_deltas"])
-            else:
-                out_arrays.append(payload["mask_packed"])
+            out_arrays.append(payload["packed"])
             meta.append({
                 "encoded": True, "shape": list(delta.shape), "size": payload["n"],
-                "n_keep": payload["n_keep"], "n_high": payload["n_high"], "n_low": payload["n_low"],
-                "h_scale": payload["h_scale"], "h_zmin": payload["h_zmin"],
-                "l_scale": payload["l_scale"], "l_zmin": payload["l_zmin"],
-                "high_bits": payload["high_bits"], "low_bits": payload["low_bits"],
-                "addr_mode": payload["addr_mode"],
+                "num_bits": payload["num_bits"], "scale": payload["scale"], "zmin": payload["zmin"],
             })
-
-            addr_bytes = (payload["idx_deltas"].nbytes if payload["addr_mode"] == "addr"
-                          else payload["mask_packed"].nbytes)
-            comm_dense_bytes += (payload["high_vals"].nbytes + payload["low_packed"].nbytes
-                                  + payload["submask_packed"].nbytes + addr_bytes)
+            comm_dense_bytes += payload["packed"].nbytes
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
@@ -386,7 +252,6 @@ class IMUClient(fl.client.NumPyClient):
             "compression_meta": json.dumps(meta),
             "comm_dense_bytes": comm_dense_bytes,
             "comm_no_compression_bytes": comm_no_compression_bytes,
-            "fisher_time_sec": fisher_time_sec,
             "transform_time_sec": transform_time_sec,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
@@ -408,38 +273,38 @@ class IMUClient(fl.client.NumPyClient):
 
 
 # ====================== STRATEGY ======================
-class FGMPStrategy(fl.server.strategy.FedAvg):
+class FGMPv3Strategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, use_compression=USE_COMPRESSION,
-                 keep_ratio_start=KEEP_RATIO_START, keep_ratio_end=KEEP_RATIO_END,
+                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END,
                  stability_lambda=STABILITY_LAMBDA, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
         self.use_compression = use_compression
-        self.keep_ratio_start = keep_ratio_start
-        self.keep_ratio_end = keep_ratio_end
+        self.num_bits_start = num_bits_start
+        self.num_bits_end = num_bits_end
         self.stability_lambda = stability_lambda
 
         self.total_comm_dense_bytes = 0
         self.total_comm_no_compression_bytes = 0
-        self.total_fisher_time_sec = 0.0
         self.total_transform_time_sec = 0.0
         self.total_reconstruct_time_sec = 0.0
 
-    def _keep_ratio_for_round(self, server_round):
+    def _num_bits_for_round(self, server_round):
         frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
         cos = 0.5 * (1 + np.cos(np.pi * frac))
-        return float(self.keep_ratio_end + (self.keep_ratio_start - self.keep_ratio_end) * cos)
+        bits = self.num_bits_end + (self.num_bits_start - self.num_bits_end) * cos
+        return int(max(1, round(bits)))
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
-        keep_ratio = self._keep_ratio_for_round(server_round)
+        num_bits = self._num_bits_for_round(server_round)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_compression"] = self.use_compression
-            fit_ins.config["keep_ratio"] = keep_ratio
+            fit_ins.config["num_bits"] = num_bits
             fit_ins.config["stability_lambda"] = self.stability_lambda
-        self._current_keep_ratio = keep_ratio
+        self._current_num_bits = num_bits
         return fit_ins_list
 
     def aggregate_fit(self, server_round, results, failures):
@@ -454,7 +319,6 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
 
         round_comm_dense_bytes = 0
         round_comm_no_compression_bytes = 0
-        round_fisher_time_sec = []
         round_transform_time_sec = []
         round_reconstruct_time_sec = 0.0
 
@@ -466,7 +330,6 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
 
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
             round_comm_no_compression_bytes += fit_res.metrics.get("comm_no_compression_bytes", 0)
-            round_fisher_time_sec.append(fit_res.metrics.get("fisher_time_sec", 0.0))
             round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
 
             _recon_start = time.perf_counter()
@@ -477,22 +340,11 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
                     arr = arrays[cursor]; cursor += 1
                     reconstructed = arr.reshape(shape)
                 else:
-                    high_vals = arrays[cursor]; cursor += 1
-                    low_packed = arrays[cursor]; cursor += 1
-                    submask_packed = arrays[cursor]; cursor += 1
-                    addr_arr = arrays[cursor]; cursor += 1
+                    packed = arrays[cursor]; cursor += 1
                     payload = {
-                        "n": m["size"], "n_keep": m["n_keep"], "n_high": m["n_high"], "n_low": m["n_low"],
-                        "h_scale": m["h_scale"], "h_zmin": m["h_zmin"],
-                        "l_scale": m["l_scale"], "l_zmin": m["l_zmin"],
-                        "high_bits": m["high_bits"], "low_bits": m["low_bits"],
-                        "addr_mode": m["addr_mode"], "high_vals": high_vals,
-                        "low_packed": low_packed, "submask_packed": submask_packed,
+                        "n": m["size"], "num_bits": m["num_bits"],
+                        "scale": m["scale"], "zmin": m["zmin"], "packed": packed,
                     }
-                    if m["addr_mode"] == "addr":
-                        payload["idx_deltas"] = addr_arr
-                    else:
-                        payload["mask_packed"] = addr_arr
                     reconstructed = mp.decode(payload).reshape(shape)
 
                 weighted_deltas[k] += reconstructed.astype(np.float64) * num_examples
@@ -512,9 +364,7 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
 
         self.total_comm_dense_bytes += round_comm_dense_bytes
         self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
-        avg_fisher_time = float(np.mean(round_fisher_time_sec)) if round_fisher_time_sec else 0.0
         avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
-        self.total_fisher_time_sec += avg_fisher_time
         self.total_transform_time_sec += avg_transform_time
         self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
@@ -522,17 +372,16 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
             round_comm_dense_bytes / round_comm_no_compression_bytes
             if round_comm_no_compression_bytes else 1.0
         )
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | keep_ratio={self._current_keep_ratio:.3f} | "
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits} | "
               f"avg_reg_loss: {avg_reg:.5f}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
-        print(f"  [compute] avg client fisher_time: {avg_fisher_time*1000:.2f}ms | "
-              f"avg client transform_time: {avg_transform_time*1000:.2f}ms | "
+        print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
               f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model_fgmp.pth")
+            torch.save(self.global_model.state_dict(), "best_model_fgmp_v3.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
@@ -542,13 +391,12 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
         return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
 
     def print_overhead_summary(self):
-        print("\n========== OVERHEAD SUMMARY (FGMP, cumulative over the run) ==========")
+        print("\n========== OVERHEAD SUMMARY (FGMP-v3, cumulative over the run) ==========")
         print(f"Total communication ACTUALLY SENT  : {self.total_comm_dense_bytes/1e6:.2f} MB")
         print(f"Total communication with NO compression (dense baseline): {self.total_comm_no_compression_bytes/1e6:.2f} MB")
         if self.total_comm_no_compression_bytes:
             print(f"  -> real compression achieved: {self.total_comm_dense_bytes/self.total_comm_no_compression_bytes*100:.1f}% "
                   f"of no-compression baseline")
-        print(f"Total client-side fisher accumulation time (avg client, summed over rounds): {self.total_fisher_time_sec:.2f}s")
         print(f"Total client-side transform time (encode, avg client, summed)  : {self.total_transform_time_sec:.2f}s")
         print(f"Total server-side reconstruct time (decode+scatter, summed)   : {self.total_reconstruct_time_sec:.2f}s")
         print(f"Best accuracy achieved: {self.best_acc:.4f}")
@@ -587,10 +435,10 @@ class FGMPStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (FGMP)")
+        plt.title("Final Confusion Matrix (FGMP-v3)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_fgmp.png")
+        plt.savefig("final_confusion_matrix_fgmp_v3.png")
         plt.close()
         return accuracy
 
@@ -611,11 +459,11 @@ def main(train_csv: str, test_csv: str):
         client_idx = cid % len(client_datasets)
         return IMUClient(client_datasets[client_idx]).to_client()
 
-    strategy = FGMPStrategy(
+    strategy = FGMPv3Strategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
-        keep_ratio_start=KEEP_RATIO_START,
-        keep_ratio_end=KEEP_RATIO_END,
+        num_bits_start=NUM_BITS_START,
+        num_bits_end=NUM_BITS_END,
         stability_lambda=STABILITY_LAMBDA,
     )
 
