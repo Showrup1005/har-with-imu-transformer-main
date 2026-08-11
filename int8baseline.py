@@ -27,7 +27,10 @@ NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
+STABILITY_LAMBDA = 0.01   # same value used across the SAC/FGMP/FP16-reg runs
+
 print(f"Using device: {DEVICE}")
+print(f"Strategy: int8, regularized | stability_lambda={STABILITY_LAMBDA}")
 
 # ============================================================
 # communication cost measurement utilities
@@ -88,7 +91,7 @@ class CommunicationTracker:
             print(f"Average upload per round:       {avg_round/1024**2:.2f} MB")
         print("=" * 60 + "\n")
 
-    def save_csv(self, path="communication_log_int8.csv"):
+    def save_csv(self, path="communication_log_int8_reg.csv"):
         import csv
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["round", "upload_bytes"])
@@ -213,10 +216,25 @@ class IMUClient(fl.client.NumPyClient):
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
         self.model.load_state_dict(state_dict, strict=True)
 
-    def fit(self, parameters, config):
+    def fit(self, parameters, fit_config):
         self.set_parameters(parameters)
+        old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
+
         self.model.train()
         total_loss = 0.0
+        total_reg_loss = 0.0
+
+        # Same running Fisher accumulator as SAC/FGMP/FP16-reg -- used
+        # ONLY for the regularizer here; nothing is selected, dropped,
+        # or quantized with it. The wire-side int8 cast is completely
+        # separate and untouched.
+        fisher_accum = {
+            name: torch.zeros_like(p)
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        n_grad_steps = 0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -225,19 +243,35 @@ class IMUClient(fl.client.NumPyClient):
 
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
-                loss = self.criterion(output, label)
+                ce_loss = self.criterion(output, label)
+
+                reg_loss = torch.zeros((), device=DEVICE)
+                if stability_lambda > 0 and n_grad_steps > 0:
+                    for name, p in self.model.named_parameters():
+                        if name in fisher_accum:
+                            f_running = (fisher_accum[name] / n_grad_steps).detach()
+                            reg_loss = reg_loss + (f_running * (p - old_state[name]) ** 2).sum()
+
+                loss = ce_loss + stability_lambda * reg_loss
                 loss.backward()
                 # Prevents exploding gradients from producing NaN weights.
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
+                for name, p in self.model.named_parameters():
+                    if p.grad is not None and name in fisher_accum:
+                        fisher_accum[name] += p.grad.detach() ** 2
+                n_grad_steps += 1
+
                 self.optimizer.step()
-                total_loss += loss.item()
+                total_loss += ce_loss.item()
+                total_reg_loss += float(reg_loss.detach().item())
 
         updated_params = self.get_parameters()  # already int8-quantized
         upload_bytes = compute_ndarrays_size(updated_params)
 
         return updated_params, len(self.train_loader.dataset), {
             "train_loss": total_loss / len(self.train_loader),
+            "avg_reg_loss": total_reg_loss / len(self.train_loader),
             "upload_bytes": upload_bytes,
         }
 
@@ -263,11 +297,12 @@ class IMUClient(fl.client.NumPyClient):
 
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, **kwargs):
+    def __init__(self, test_loader, stability_lambda=STABILITY_LAMBDA, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
+        self.stability_lambda = stability_lambda
 
     def configure_fit(self, server_round, parameters, client_manager):
         # quantize the outgoing global model to int8 before it's
@@ -275,7 +310,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         ndarrays = parameters_to_ndarrays(parameters)
         quantized_ndarrays = quantize_to_int8(ndarrays)
         quantized_parameters = ndarrays_to_parameters(quantized_ndarrays)
-        return super().configure_fit(server_round, quantized_parameters, client_manager)
+        fit_ins_list = super().configure_fit(server_round, quantized_parameters, client_manager)
+        for _, fit_ins in fit_ins_list:
+            fit_ins.config["stability_lambda"] = self.stability_lambda
+        return fit_ins_list
 
     def configure_evaluate(self, server_round, parameters, client_manager):
         # Mirror configure_fit: the client's set_parameters() always expects
@@ -294,8 +332,11 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         # sum up actual upload bytes reported by each client this round
         # (already reflects int8+scale wire size via compute_ndarrays_size)
         round_upload = 0
+        reg_losses = []
         for _, fit_res in results:
-            round_upload += fit_res.metrics.get("upload_bytes", 0)
+            metrics = fit_res.metrics
+            round_upload += metrics.get("upload_bytes", 0)
+            reg_losses.append(metrics.get("avg_reg_loss", 0.0))
         comm_tracker.log_round(server_round, round_upload)
 
         # dequantize each client's returned int8 parameters back to
@@ -325,18 +366,20 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         # Accuracy after every round
         acc = self.evaluate_global(final=False)
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f}")
+        avg_reg = float(np.mean(reg_losses)) if reg_losses else 0.0
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | avg_reg_loss: {avg_reg:.5f}")
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model_int8.pth")
+            torch.save(self.global_model.state_dict(), "best_model_int8_reg.pth")
 
         # Final evaluation after last round
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
             comm_tracker.summary()
-            comm_tracker.save_csv("communication_log_int8.csv")
+            comm_tracker.save_csv("communication_log_int8_reg.csv")
+            print(f"Best accuracy achieved: {self.best_acc:.4f}")
 
         return aggregated
 
@@ -384,10 +427,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (int8 quantized comm)")
+        plt.title("Final Confusion Matrix (int8 quantized comm, regularized)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_int8.png")
+        plt.savefig("final_confusion_matrix_int8_reg.png")
         plt.close()
 
         return accuracy
@@ -421,10 +464,11 @@ def main(train_csv: str, test_csv: str):
 
     strategy = SaveModelStrategy(
         test_loader=test_loader,
+        stability_lambda=STABILITY_LAMBDA,
         initial_parameters=initial_parameters,  # passed through **kwargs to FedAvg
     )
 
-    print(f"Starting FL (int8 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
+    print(f"Starting FL (int8 quantized communication, regularized) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
     fl.simulation.start_simulation(
         client_fn=client_fn,

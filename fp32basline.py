@@ -2,6 +2,7 @@ import flwr as fl
 import torch
 import numpy as np
 import json
+import time
 import warnings
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
@@ -27,14 +28,17 @@ NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
+STABILITY_LAMBDA = 0.01   # same value used across the SAC/FGMP runs
+
 print(f"Using device: {DEVICE}")
+print(f"Strategy: FP32, regularized (no compression) | stability_lambda={STABILITY_LAMBDA}")
 
 # ============================================================
 #  communication cost measurement utilities
+#  (unchanged from the plain FP32 baseline -- upload is the figure
+#  comparable to SAC/FedZip/FGMP's comm_dense_bytes)
 # ============================================================
 def compute_ndarrays_size(ndarrays):
-    """Total size in bytes of a list of numpy arrays, as they'll actually
-    be sent over the wire (each array's own dtype, not assumed fp32)."""
     return sum(arr.nbytes for arr in ndarrays)
 
 
@@ -56,7 +60,7 @@ def print_model_size_summary(model):
 
 class CommunicationTracker:
     def __init__(self):
-        self.round_log = []  # list of dicts per round
+        self.round_log = []
         self.total_download_bytes = 0
         self.total_upload_bytes = 0
 
@@ -72,7 +76,7 @@ class CommunicationTracker:
         })
         print(f"  [Comm] Round {server_round}: "
               f"download={download_bytes/1024**2:.2f} MB, "
-              f"upload={upload_bytes/1024**2:.2f} MB, "
+              f"upload={upload_bytes/1024**2:.2f} MB (<- comparable to SAC/FedZip/FGMP), "
               f"round_total={total_round_bytes/1024**2:.2f} MB")
 
     def summary(self):
@@ -81,7 +85,7 @@ class CommunicationTracker:
         print("COMMUNICATION COST SUMMARY")
         print("=" * 60)
         print(f"Total download (server->client):        {self.total_download_bytes/1024**2:.2f} MB")
-        print(f"Total upload   (client->server):         {self.total_upload_bytes/1024**2:.2f} MB   <-- use this for the SAC/FedZip comparison table")
+        print(f"Total upload   (client->server):         {self.total_upload_bytes/1024**2:.2f} MB   <-- use this for the comparison table")
         print(f"Total round-trip (download + upload):    {total/1024**2:.2f} MB ({total/1024**3:.4f} GB)")
         if self.round_log:
             avg_round_upload = self.total_upload_bytes / len(self.round_log)
@@ -90,7 +94,7 @@ class CommunicationTracker:
             print(f"Average round-trip per round:             {avg_round_total/1024**2:.2f} MB")
         print("=" * 60 + "\n")
 
-    def save_csv(self, path="communication_log.csv"):
+    def save_csv(self, path="communication_log_fp32_reg.csv"):
         import csv
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["round", "download_bytes", "upload_bytes", "total_bytes"])
@@ -159,33 +163,62 @@ class IMUClient(fl.client.NumPyClient):
         state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
         self.model.load_state_dict(state_dict, strict=True)
 
-    def fit(self, parameters, config):
-        # measure download size (server -> this client) before training
+    def fit(self, parameters, fit_config):
         download_bytes = compute_ndarrays_size(parameters)
 
         self.set_parameters(parameters)
+        old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
+
         self.model.train()
         total_loss = 0.0
+        total_reg_loss = 0.0
+
+        # Same running Fisher accumulator as SAC/FGMP -- squared
+        # gradients, no extra backward pass. Used ONLY for the
+        # regularizer here; nothing is selected, dropped, or quantized
+        # with it.
+        fisher_accum = {
+            name: torch.zeros_like(p)
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        n_grad_steps = 0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
-
                 imu = batch["imu"].to(DEVICE).float()
                 label = batch["label"].to(DEVICE).long()
 
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
-                loss = self.criterion(output, label)
+                ce_loss = self.criterion(output, label)
+
+                reg_loss = torch.zeros((), device=DEVICE)
+                if stability_lambda > 0 and n_grad_steps > 0:
+                    for name, p in self.model.named_parameters():
+                        if name in fisher_accum:
+                            f_running = (fisher_accum[name] / n_grad_steps).detach()
+                            reg_loss = reg_loss + (f_running * (p - old_state[name]) ** 2).sum()
+
+                loss = ce_loss + stability_lambda * reg_loss
                 loss.backward()
+
+                for name, p in self.model.named_parameters():
+                    if p.grad is not None and name in fisher_accum:
+                        fisher_accum[name] += p.grad.detach() ** 2
+                n_grad_steps += 1
+
                 self.optimizer.step()
-                total_loss += loss.item()
+                total_loss += ce_loss.item()
+                total_reg_loss += float(reg_loss.detach().item())
 
         updated_params = self.get_parameters()
-        
         upload_bytes = compute_ndarrays_size(updated_params)
 
         return updated_params, len(self.train_loader.dataset), {
             "train_loss": total_loss / len(self.train_loader),
+            "avg_reg_loss": total_reg_loss / len(self.train_loader),
             "download_bytes": download_bytes,
             "upload_bytes": upload_bytes,
         }
@@ -212,22 +245,30 @@ class IMUClient(fl.client.NumPyClient):
 
 # ====================== STRATEGY ======================
 class SaveModelStrategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, **kwargs):
+    def __init__(self, test_loader, stability_lambda=STABILITY_LAMBDA, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
+        self.stability_lambda = stability_lambda
+
+    def configure_fit(self, server_round, parameters, client_manager):
+        fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
+        for _, fit_ins in fit_ins_list:
+            fit_ins.config["stability_lambda"] = self.stability_lambda
+        return fit_ins_list
 
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
 
-        # sum up actual download/upload bytes reported by each client this round
         round_download = 0
         round_upload = 0
+        reg_losses = []
         for _, fit_res in results:
             metrics = fit_res.metrics
             round_download += metrics.get("download_bytes", 0)
             round_upload += metrics.get("upload_bytes", 0)
+            reg_losses.append(metrics.get("avg_reg_loss", 0.0))
         comm_tracker.log_round(server_round, round_download, round_upload)
 
         aggregated = super().aggregate_fit(server_round, results, failures)
@@ -244,21 +285,20 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
         }
         self.global_model.load_state_dict(state_dict, strict=True)
 
-        # Accuracy after every round
         acc = self.evaluate_global(final=False)
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f}")
+        avg_reg = float(np.mean(reg_losses)) if reg_losses else 0.0
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | avg_reg_loss: {avg_reg:.5f}")
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
+            torch.save(self.global_model.state_dict(), "best_model_fp32_reg.pth")
 
-        # Final evaluation after last round
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
-            # print and save communication summary at the very end
             comm_tracker.summary()
-            comm_tracker.save_csv("communication_log.csv")
+            comm_tracker.save_csv("communication_log_fp32_reg.csv")
+            print(f"Best accuracy achieved: {self.best_acc:.4f}")
 
         return aggregated
 
@@ -284,31 +324,12 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         accuracy = accuracy_score(all_labels, all_preds)
 
-        # During training rounds, return only accuracy
         if not final:
             return accuracy
 
-        # Only after final round
-        precision = precision_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
-
-        recall = recall_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
-
-        f1 = f1_score(
-            all_labels,
-            all_preds,
-            average="weighted",
-            zero_division=0,
-        )
+        precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+        recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
 
         print(f"Accuracy : {accuracy:.4f}")
         print(f"Precision: {precision:.4f}")
@@ -325,10 +346,10 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix")
+        plt.title("Final Confusion Matrix (FP32, regularized, no compression)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix.png")
+        plt.savefig("final_confusion_matrix_fp32_reg.png")
         plt.close()
 
         return accuracy
@@ -340,7 +361,6 @@ def main(train_csv: str, test_csv: str):
 
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    # print model size / theoretical per-round cost before training starts
     _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
     print_model_size_summary(_tmp_model)
     del _tmp_model
@@ -357,7 +377,7 @@ def main(train_csv: str, test_csv: str):
 
         return IMUClient(client_datasets[client_idx]).to_client()
 
-    strategy = SaveModelStrategy(test_loader=test_loader)
+    strategy = SaveModelStrategy(test_loader=test_loader, stability_lambda=STABILITY_LAMBDA)
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
