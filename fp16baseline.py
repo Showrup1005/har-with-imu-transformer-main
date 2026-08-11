@@ -27,7 +27,7 @@ NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
-STABILITY_LAMBDA = 0.01   # same value used across the SAC/FGMP/FP32-reg runs
+STABILITY_LAMBDA = 0.01 
 
 print(f"Using device: {DEVICE}")
 print(f"Strategy: FP16, regularized | stability_lambda={STABILITY_LAMBDA}")
@@ -74,7 +74,7 @@ class CommunicationTracker:
         })
         print(f"  [Comm] Round {server_round}: "
               f"download={download_bytes/1024**2:.2f} MB, "
-              f"upload={upload_bytes/1024**2:.2f} MB (<- comparable to SAC/FedZip/FGMP), "
+              f"upload={upload_bytes/1024**2:.2f} MB, "
               f"round_total={total_round_bytes/1024**2:.2f} MB")
 
     def summary(self):

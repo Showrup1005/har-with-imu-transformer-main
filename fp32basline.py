@@ -28,15 +28,13 @@ NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
-STABILITY_LAMBDA = 0.01   # same value used across the SAC/FGMP runs
+STABILITY_LAMBDA = 0.01   
 
 print(f"Using device: {DEVICE}")
 print(f"Strategy: FP32, regularized (no compression) | stability_lambda={STABILITY_LAMBDA}")
 
 # ============================================================
 #  communication cost measurement utilities
-#  (unchanged from the plain FP32 baseline -- upload is the figure
-#  comparable to SAC/FedZip/FGMP's comm_dense_bytes)
 # ============================================================
 def compute_ndarrays_size(ndarrays):
     return sum(arr.nbytes for arr in ndarrays)
@@ -76,7 +74,7 @@ class CommunicationTracker:
         })
         print(f"  [Comm] Round {server_round}: "
               f"download={download_bytes/1024**2:.2f} MB, "
-              f"upload={upload_bytes/1024**2:.2f} MB (<- comparable to SAC/FedZip/FGMP), "
+              f"upload={upload_bytes/1024**2:.2f} MB, "
               f"round_total={total_round_bytes/1024**2:.2f} MB")
 
     def summary(self):
@@ -85,7 +83,7 @@ class CommunicationTracker:
         print("COMMUNICATION COST SUMMARY")
         print("=" * 60)
         print(f"Total download (server->client):        {self.total_download_bytes/1024**2:.2f} MB")
-        print(f"Total upload   (client->server):         {self.total_upload_bytes/1024**2:.2f} MB   <-- use this for the comparison table")
+        print(f"Total upload   (client->server):         {self.total_upload_bytes/1024**2:.2f} MB")
         print(f"Total round-trip (download + upload):    {total/1024**2:.2f} MB ({total/1024**3:.4f} GB)")
         if self.round_log:
             avg_round_upload = self.total_upload_bytes / len(self.round_log)
@@ -174,10 +172,6 @@ class IMUClient(fl.client.NumPyClient):
         total_loss = 0.0
         total_reg_loss = 0.0
 
-        # Same running Fisher accumulator as SAC/FGMP -- squared
-        # gradients, no extra backward pass. Used ONLY for the
-        # regularizer here; nothing is selected, dropped, or quantized
-        # with it.
         fisher_accum = {
             name: torch.zeros_like(p)
             for name, p in self.model.named_parameters()

@@ -27,7 +27,7 @@ NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
-STABILITY_LAMBDA = 0.01   # same value used across the SAC/FGMP/FP16-reg runs
+STABILITY_LAMBDA = 0.01   
 
 print(f"Using device: {DEVICE}")
 print(f"Strategy: int8, regularized | stability_lambda={STABILITY_LAMBDA}")
