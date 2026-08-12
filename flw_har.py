@@ -101,13 +101,15 @@ LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
 USE_COMPRESSION = True
+USE_STABILITY_REG = False
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
 STABILITY_LAMBDA = 0.01
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
-print(f"Compression strategy: FGMP-v3 (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
+print(f"Compression strategy: FGMP (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
+      f"stability_reg={USE_STABILITY_REG} | "
       f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
       f"keep_ratio=1.0 always | stability_lambda={STABILITY_LAMBDA}")
 
@@ -170,6 +172,7 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_compression = fit_config.get("use_compression", USE_COMPRESSION)
+        use_stability_reg = fit_config.get("use_stability_reg", USE_STABILITY_REG)
         num_bits = int(fit_config.get("num_bits", NUM_BITS_START))
         stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
 
@@ -197,7 +200,7 @@ class IMUClient(fl.client.NumPyClient):
                 ce_loss = self.criterion(output, label)
 
                 reg_loss = torch.zeros((), device=DEVICE)
-                if use_compression and stability_lambda > 0 and n_grad_steps > 0:
+                if use_stability_reg and stability_lambda > 0 and n_grad_steps > 0:
                     for name, p in self.model.named_parameters():
                         if name in fisher_accum:
                             f_running = (fisher_accum[name] / n_grad_steps).detach()
@@ -206,9 +209,10 @@ class IMUClient(fl.client.NumPyClient):
                 loss = ce_loss + stability_lambda * reg_loss
                 loss.backward()
 
-                for name, p in self.model.named_parameters():
-                    if p.grad is not None and name in fisher_accum:
-                        fisher_accum[name] += p.grad.detach() ** 2
+                if use_stability_reg:
+                    for name, p in self.model.named_parameters():
+                        if p.grad is not None and name in fisher_accum:
+                            fisher_accum[name] += p.grad.detach() ** 2
                 n_grad_steps += 1
 
                 self.optimizer.step()
@@ -273,8 +277,8 @@ class IMUClient(fl.client.NumPyClient):
 
 
 # ====================== STRATEGY ======================
-class FGMPv3Strategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, use_compression=USE_COMPRESSION,
+class Strategy(fl.server.strategy.FedAvg):
+    def __init__(self, test_loader, use_compression=USE_COMPRESSION, use_stability_reg=USE_STABILITY_REG,
                  num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END,
                  stability_lambda=STABILITY_LAMBDA, **kwargs):
         super().__init__(**kwargs)
@@ -282,6 +286,7 @@ class FGMPv3Strategy(fl.server.strategy.FedAvg):
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
         self.use_compression = use_compression
+        self.use_stability_reg = use_stability_reg
         self.num_bits_start = num_bits_start
         self.num_bits_end = num_bits_end
         self.stability_lambda = stability_lambda
@@ -302,6 +307,7 @@ class FGMPv3Strategy(fl.server.strategy.FedAvg):
         num_bits = self._num_bits_for_round(server_round)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_compression"] = self.use_compression
+            fit_ins.config["use_stability_reg"] = self.use_stability_reg
             fit_ins.config["num_bits"] = num_bits
             fit_ins.config["stability_lambda"] = self.stability_lambda
         self._current_num_bits = num_bits
@@ -373,7 +379,7 @@ class FGMPv3Strategy(fl.server.strategy.FedAvg):
             if round_comm_no_compression_bytes else 1.0
         )
         print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits} | "
-              f"avg_reg_loss: {avg_reg:.5f}")
+      f"stability_reg={self.use_stability_reg} | avg_reg_loss: {avg_reg:.5f}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
         print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
@@ -381,7 +387,7 @@ class FGMPv3Strategy(fl.server.strategy.FedAvg):
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model_fgmp_v3.pth")
+            torch.save(self.global_model.state_dict(), "best_model.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
@@ -391,7 +397,7 @@ class FGMPv3Strategy(fl.server.strategy.FedAvg):
         return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
 
     def print_overhead_summary(self):
-        print("\n========== OVERHEAD SUMMARY (FGMP-v3, cumulative over the run) ==========")
+        print("\n========== OVERHEAD SUMMARY (FGMP, cumulative over the run) ==========")
         print(f"Total communication ACTUALLY SENT  : {self.total_comm_dense_bytes/1e6:.2f} MB")
         print(f"Total communication with NO compression (dense baseline): {self.total_comm_no_compression_bytes/1e6:.2f} MB")
         if self.total_comm_no_compression_bytes:
@@ -435,10 +441,10 @@ class FGMPv3Strategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (FGMP-v3)")
+        plt.title("Final Confusion Matrix (FGMP)")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix_fgmp_v3.png")
+        plt.savefig("final_confusion_matrix.png")
         plt.close()
         return accuracy
 
@@ -459,9 +465,10 @@ def main(train_csv: str, test_csv: str):
         client_idx = cid % len(client_datasets)
         return IMUClient(client_datasets[client_idx]).to_client()
 
-    strategy = FGMPv3Strategy(
+    strategy = Strategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
+        use_stability_reg=USE_STABILITY_REG,
         num_bits_start=NUM_BITS_START,
         num_bits_end=NUM_BITS_END,
         stability_lambda=STABILITY_LAMBDA,
