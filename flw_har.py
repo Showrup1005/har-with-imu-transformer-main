@@ -1,3 +1,4 @@
+import argparse
 import flwr as fl
 import torch
 import numpy as np
@@ -14,6 +15,21 @@ warnings.filterwarnings("ignore")
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
+
+
+# ====================== ARGS ======================
+def parse_args():
+    parser = argparse.ArgumentParser(description="FL baseline")
+    parser.add_argument("--seed", type=int, default=42,
+                         help="Random seed for torch/numpy/CUDA and the client data split (default: 42)")
+    parser.add_argument("--train_csv", type=str, default="train.csv")
+    parser.add_argument("--test_csv", type=str, default="test.csv")
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+ARGS = parse_args()
+SEED = ARGS.seed
 
 
 # ====================== UNIFORM-PRECISION QUANT HELPERS ======================
@@ -87,10 +103,10 @@ with open('config.json', 'r') as f:
     config = json.load(f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.manual_seed(42)
-np.random.seed(42)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(42)
+    torch.cuda.manual_seed_all(SEED)
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
@@ -104,6 +120,7 @@ STABILITY_LAMBDA = 0.01
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
+print(f"Seed: {SEED}")
 print(f"Compression strategy: FGMP (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
       f"stability_reg={USE_STABILITY_REG} | "
       f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
@@ -117,7 +134,7 @@ def load_data(train_csv: str, test_csv: str):
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
 
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=42):
+def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
     n = len(train_dataset)
     indices = np.arange(n)
     np.random.seed(seed)
@@ -383,7 +400,7 @@ class Strategy(fl.server.strategy.FedAvg):
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), "best_model.pth")
+            torch.save(self.global_model.state_dict(), f"best_model_seed{SEED}.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
@@ -393,7 +410,7 @@ class Strategy(fl.server.strategy.FedAvg):
         return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
 
     def print_overhead_summary(self):
-        print("\n========== OVERHEAD SUMMARY (FGMP, cumulative over the run) ==========")
+        print(f"\n========== OVERHEAD SUMMARY (FGMP, seed={SEED}, cumulative over the run) ==========")
         print(f"Total communication ACTUALLY SENT  : {self.total_comm_dense_bytes/1e6:.2f} MB")
         print(f"Total communication with NO compression (dense baseline): {self.total_comm_no_compression_bytes/1e6:.2f} MB")
         if self.total_comm_no_compression_bytes:
@@ -437,10 +454,10 @@ class Strategy(fl.server.strategy.FedAvg):
 
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title("Final Confusion Matrix (FGMP)")
+        plt.title(f"Final Confusion Matrix (FGMP, seed={SEED})")
         plt.xlabel("Predicted")
         plt.ylabel("True")
-        plt.savefig("final_confusion_matrix.png")
+        plt.savefig(f"final_confusion_matrix_seed{SEED}.png")
         plt.close()
         return accuracy
 
@@ -448,7 +465,7 @@ class Strategy(fl.server.strategy.FedAvg):
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
+    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=SEED)
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     def client_fn(context):
@@ -470,7 +487,7 @@ def main(train_csv: str, test_csv: str):
         stability_lambda=STABILITY_LAMBDA,
     )
 
-    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
+    print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
@@ -480,4 +497,4 @@ def main(train_csv: str, test_csv: str):
     )
 
 if __name__ == "__main__":
-    main("train.csv", "test.csv")
+    main(ARGS.train_csv, ARGS.test_csv)
