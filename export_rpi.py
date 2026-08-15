@@ -112,7 +112,7 @@ NUM_CLIENTS = 7
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
-USE_COMPRESSION = False
+USE_COMPRESSION = True
 USE_STABILITY_REG = False
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
@@ -134,6 +134,22 @@ def load_data(train_csv: str, test_csv: str):
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
 
+class ClientArrayDataset(torch.utils.data.Dataset):
+    """Holds only ONE client's data — no reference to the parent dataset."""
+    def __init__(self, imu_arr, label_arr):
+        self.imu_arr = imu_arr
+        self.label_arr = label_arr
+
+    def __len__(self):
+        return len(self.label_arr)
+
+    def __getitem__(self, idx):
+        return {
+            "imu": torch.as_tensor(self.imu_arr[idx]),
+            "label": torch.as_tensor(self.label_arr[idx]),
+        }
+
+
 def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
     n = len(train_dataset)
     indices = np.arange(n)
@@ -146,17 +162,23 @@ def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
     for i in range(num_clients):
         start = i * size
         end = start + size if i < num_clients - 1 else n
-        subset = Subset(train_dataset, indices[start:end])
-        client_datasets.append(subset)
+        idx_slice = indices[start:end]
 
-        labels = []
-        for idx in indices[start:end]:
+        imu_list, label_list = [], []
+        for idx in idx_slice:
             sample = train_dataset[idx]
-            label = sample['label'].item() if torch.is_tensor(sample['label']) else sample['label']
-            labels.append(label)
-        unique, counts = np.unique(labels, return_counts=True)
+            imu = sample["imu"]
+            label = sample["label"]
+            imu_list.append(imu.numpy() if torch.is_tensor(imu) else np.asarray(imu))
+            label_list.append(label.item() if torch.is_tensor(label) else label)
+
+        imu_arr = np.stack(imu_list)
+        label_arr = np.array(label_list)
+        client_datasets.append(ClientArrayDataset(imu_arr, label_arr))
+
+        unique, counts = np.unique(label_arr, return_counts=True)
         dist = dict(zip(unique.tolist(), counts.tolist()))
-        print(f"Client {i} → {len(subset)} samples | Label distribution: {dist}")
+        print(f"Client {i} → {len(label_arr)} samples | Label distribution: {dist}")
     print("=" * 60)
     return client_datasets
 
@@ -466,6 +488,8 @@ class Strategy(fl.server.strategy.FedAvg):
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=SEED)
+    del train_dataset
+    import gc; gc.collect()
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     def client_fn(context):
@@ -494,6 +518,7 @@ def main(train_csv: str, test_csv: str):
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
         client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
+        ray_init_args={"object_store_memory": 500_000_000},
     )
 
 if __name__ == "__main__":
