@@ -5,6 +5,7 @@ import numpy as np
 import json
 import time
 import warnings
+import gc
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import seaborn as sns
@@ -118,6 +119,18 @@ NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
 STABILITY_LAMBDA = 0.01
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
+
+# ---- Ray / simulation memory controls -------------------------------------
+# Colab's free-tier instance has ~12.7GB total RAM. Each ClientAppActor
+# process carries a fixed ~3GB baseline just from importing torch/flwr/ray
+# and instantiating the model+optimizer, independent of how much per-client
+# data it holds. Running 2 actors concurrently (Ray's default with 2 CPUs)
+# plus the ~3.5GB main Colab kernel process reliably exceeds the 95% OOM
+# threshold. Capping Ray to a single logical CPU forces a single-actor pool,
+# so only one ClientAppActor exists at a time.
+RAY_NUM_CPUS = 1
+RAY_OBJECT_STORE_BYTES = 500_000_000  # object store usage was ~0.25MB in logs; no need to reserve ~4GB
+# -----------------------------------------------------------------------------
 
 print(f"Using device: {DEVICE}")
 print(f"Seed: {SEED}")
@@ -488,8 +501,13 @@ class Strategy(fl.server.strategy.FedAvg):
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=SEED)
+
+    # Free the full dataset now that every client's data has been extracted
+    # into small standalone arrays -- nothing needs the parent object anymore,
+    # and holding onto it wastes memory for the entire 40-round run.
     del train_dataset
-    import gc; gc.collect()
+    gc.collect()
+
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     def client_fn(context):
@@ -518,7 +536,15 @@ def main(train_csv: str, test_csv: str):
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
         client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-        ray_init_args={"object_store_memory": 500_000_000},
+        # RAY_NUM_CPUS=1 forces Ray to create a SINGLE ClientAppActor instead
+        # of 2, which is the actual fix for the OOM: each actor has a fixed
+        # ~3GB baseline cost (torch/flwr/ray imports + model/optimizer),
+        # independent of client data size, and 2 concurrent actors + the
+        # ~3.5GB main Colab process reliably exceeds a 12.7GB instance.
+        ray_init_args={
+            "num_cpus": RAY_NUM_CPUS,
+            "object_store_memory": RAY_OBJECT_STORE_BYTES,
+        },
     )
 
 if __name__ == "__main__":
