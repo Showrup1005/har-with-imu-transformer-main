@@ -1,11 +1,9 @@
-import argparse
 import flwr as fl
 import torch
 import numpy as np
 import json
 import time
 import warnings
-import gc
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 import seaborn as sns
@@ -16,21 +14,6 @@ warnings.filterwarnings("ignore")
 from models.IMUTransformerEncoder import IMUTransformerEncoder
 from util.IMUDataset import IMUDataset
 from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
-
-
-# ====================== ARGS ======================
-def parse_args():
-    parser = argparse.ArgumentParser(description="FL baseline")
-    parser.add_argument("--seed", type=int, default=42,
-                         help="Random seed for torch/numpy/CUDA and the client data split (default: 42)")
-    parser.add_argument("--train_csv", type=str, default="train.csv")
-    parser.add_argument("--test_csv", type=str, default="test.csv")
-    args, _unknown = parser.parse_known_args()
-    return args
-
-
-ARGS = parse_args()
-SEED = ARGS.seed
 
 
 # ====================== UNIFORM-PRECISION QUANT HELPERS ======================
@@ -104,36 +87,23 @@ with open('config.json', 'r') as f:
     config = json.load(f)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+torch.manual_seed(42)
+np.random.seed(42)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
+    torch.cuda.manual_seed_all(42)
 
-NUM_CLIENTS = 7
+NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
-USE_COMPRESSION = True
-USE_STABILITY_REG = False
+USE_COMPRESSION = False
+USE_STABILITY_REG = True
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
 STABILITY_LAMBDA = 0.01
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
-# ---- Ray / simulation memory controls -------------------------------------
-# Colab's free-tier instance has ~12.7GB total RAM. Each ClientAppActor
-# process carries a fixed ~3GB baseline just from importing torch/flwr/ray
-# and instantiating the model+optimizer, independent of how much per-client
-# data it holds. Running 2 actors concurrently (Ray's default with 2 CPUs)
-# plus the ~3.5GB main Colab kernel process reliably exceeds the 95% OOM
-# threshold. Capping Ray to a single logical CPU forces a single-actor pool,
-# so only one ClientAppActor exists at a time.
-RAY_NUM_CPUS = 1
-RAY_OBJECT_STORE_BYTES = 500_000_000  # object store usage was ~0.25MB in logs; no need to reserve ~4GB
-# -----------------------------------------------------------------------------
-
 print(f"Using device: {DEVICE}")
-print(f"Seed: {SEED}")
 print(f"Compression strategy: FGMP (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
       f"stability_reg={USE_STABILITY_REG} | "
       f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
@@ -147,23 +117,7 @@ def load_data(train_csv: str, test_csv: str):
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
 
-class ClientArrayDataset(torch.utils.data.Dataset):
-    """Holds only ONE client's data — no reference to the parent dataset."""
-    def __init__(self, imu_arr, label_arr):
-        self.imu_arr = imu_arr
-        self.label_arr = label_arr
-
-    def __len__(self):
-        return len(self.label_arr)
-
-    def __getitem__(self, idx):
-        return {
-            "imu": torch.as_tensor(self.imu_arr[idx]),
-            "label": torch.as_tensor(self.label_arr[idx]),
-        }
-
-
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
+def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=42):
     n = len(train_dataset)
     indices = np.arange(n)
     np.random.seed(seed)
@@ -175,23 +129,17 @@ def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
     for i in range(num_clients):
         start = i * size
         end = start + size if i < num_clients - 1 else n
-        idx_slice = indices[start:end]
+        subset = Subset(train_dataset, indices[start:end])
+        client_datasets.append(subset)
 
-        imu_list, label_list = [], []
-        for idx in idx_slice:
+        labels = []
+        for idx in indices[start:end]:
             sample = train_dataset[idx]
-            imu = sample["imu"]
-            label = sample["label"]
-            imu_list.append(imu.numpy() if torch.is_tensor(imu) else np.asarray(imu))
-            label_list.append(label.item() if torch.is_tensor(label) else label)
-
-        imu_arr = np.stack(imu_list)
-        label_arr = np.array(label_list)
-        client_datasets.append(ClientArrayDataset(imu_arr, label_arr))
-
-        unique, counts = np.unique(label_arr, return_counts=True)
+            label = sample['label'].item() if torch.is_tensor(sample['label']) else sample['label']
+            labels.append(label)
+        unique, counts = np.unique(labels, return_counts=True)
         dist = dict(zip(unique.tolist(), counts.tolist()))
-        print(f"Client {i} → {len(label_arr)} samples | Label distribution: {dist}")
+        print(f"Client {i} → {len(subset)} samples | Label distribution: {dist}")
     print("=" * 60)
     return client_datasets
 
@@ -435,79 +383,95 @@ class Strategy(fl.server.strategy.FedAvg):
 
         if acc > self.best_acc:
             self.best_acc = acc
-            torch.save(self.global_model.state_dict(), f"best_model_seed{SEED}.pth")
+            torch.save(self.global_model.state_dict(), "best_model.pth")
 
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
-            self.evaluate_global(final=True)
-            self.print_overhead_summary()
+            self.evaluate_global(final=True)   
+            self.save_run_data()               
 
         return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
 
-    def print_overhead_summary(self):
-        print(f"\n========== OVERHEAD SUMMARY (FGMP, seed={SEED}, cumulative over the run) ==========")
-        print(f"Total communication ACTUALLY SENT  : {self.total_comm_dense_bytes/1e6:.2f} MB")
-        print(f"Total communication with NO compression (dense baseline): {self.total_comm_no_compression_bytes/1e6:.2f} MB")
-        if self.total_comm_no_compression_bytes:
-            print(f"  -> real compression achieved: {self.total_comm_dense_bytes/self.total_comm_no_compression_bytes*100:.1f}% "
-                  f"of no-compression baseline")
-        print(f"Total client-side transform time (encode, avg client, summed)  : {self.total_transform_time_sec:.2f}s")
-        print(f"Total server-side reconstruct time (decode+scatter, summed)   : {self.total_reconstruct_time_sec:.2f}s")
-        print(f"Best accuracy achieved: {self.best_acc:.4f}")
+    def save_run_data(self, path="fl_run_history.npz"):
+        h = self.history
+        save_kwargs = {k: np.array(v) for k, v in h.items()}
+
+        save_kwargs.update({
+            "final_labels": getattr(self, "_final_all_labels", np.array([])),
+            "final_preds": getattr(self, "_final_all_preds", np.array([])),
+            "final_probs": getattr(self, "_final_all_probs", np.array([])),
+            "total_comm_dense_bytes": self.total_comm_dense_bytes,
+            "total_comm_no_compression_bytes": self.total_comm_no_compression_bytes,
+            "total_transform_time_sec": self.total_transform_time_sec,
+            "total_reconstruct_time_sec": self.total_reconstruct_time_sec,
+            "best_acc": self.best_acc,
+            "num_rounds": NUM_ROUNDS,
+            "num_clients": NUM_CLIENTS,
+            "use_compression": self.use_compression,
+            "num_bits_start": self.num_bits_start,
+            "num_bits_end": self.num_bits_end,
+        })
+
+        np.savez(path, **save_kwargs)
+        print(f"Saved run data to {path}")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
-        all_preds, all_labels = [], []
+        all_preds, all_labels, all_probs = [], [], []
         with torch.no_grad():
             for batch in self.test_loader:
                 imu = batch["imu"].to(DEVICE).float()
                 labels = batch["label"].to(DEVICE).long()
                 outputs = self.global_model({"imu": imu})
+                probs = torch.softmax(outputs, dim=1)
                 preds = outputs.argmax(dim=1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
 
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
-        accuracy = accuracy_score(all_labels, all_preds)
-        if not final:
-            return accuracy
+        all_probs = np.array(all_probs)
 
-        precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
-        recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
-        f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
+        accuracy = accuracy_score(all_labels, all_preds)
+        precision_w = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+        recall_w = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+        f1_w = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
+        precision_m = precision_score(all_labels, all_preds, average="macro", zero_division=0)
+        recall_m = recall_score(all_labels, all_preds, average="macro", zero_division=0)
+        f1_m = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+
+        try:
+            from sklearn.preprocessing import label_binarize
+            from sklearn.metrics import roc_auc_score
+            classes = np.unique(all_labels)
+            y_onehot = label_binarize(all_labels, classes=classes)
+            auc_macro = roc_auc_score(y_onehot, all_probs, multi_class="ovr", average="macro")
+        except Exception:
+            auc_macro = float("nan")
+
+        if not final:
+            return accuracy, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro
 
         print(f"Accuracy : {accuracy:.4f}")
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall   : {recall:.4f}")
-        print(f"F1 Score : {f1:.4f}")
+        print(f"Precision (weighted): {precision_w:.4f} | (macro): {precision_m:.4f}")
+        print(f"Recall    (weighted): {recall_w:.4f} | (macro): {recall_m:.4f}")
+        print(f"F1        (weighted): {f1_w:.4f} | (macro): {f1_m:.4f}")
+        print(f"ROC-AUC (macro, OvR): {auc_macro:.4f}")
         print("\nClassification Report")
         print(classification_report(all_labels, all_preds, zero_division=0))
-        cm = confusion_matrix(all_labels, all_preds)
-        print("\nConfusion Matrix")
-        print(cm)
 
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title(f"Final Confusion Matrix (FGMP, seed={SEED})")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.savefig(f"final_confusion_matrix_seed{SEED}.png")
-        plt.close()
+        self._final_all_labels = all_labels  
+        self._final_all_preds = all_preds     
+        self._final_all_probs = all_probs     
+
         return accuracy
 
 
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=SEED)
-
-    # Free the full dataset now that every client's data has been extracted
-    # into small standalone arrays -- nothing needs the parent object anymore,
-    # and holding onto it wastes memory for the entire 40-round run.
-    del train_dataset
-    gc.collect()
-
+    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     def client_fn(context):
@@ -529,23 +493,14 @@ def main(train_csv: str, test_csv: str):
         stability_lambda=STABILITY_LAMBDA,
     )
 
-    print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
+    print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
         client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-        # RAY_NUM_CPUS=1 forces Ray to create a SINGLE ClientAppActor instead
-        # of 2, which is the actual fix for the OOM: each actor has a fixed
-        # ~3GB baseline cost (torch/flwr/ray imports + model/optimizer),
-        # independent of client data size, and 2 concurrent actors + the
-        # ~3.5GB main Colab process reliably exceeds a 12.7GB instance.
-        ray_init_args={
-            "num_cpus": RAY_NUM_CPUS,
-            "object_store_memory": RAY_OBJECT_STORE_BYTES,
-        },
     )
 
 if __name__ == "__main__":
-    main(ARGS.train_csv, ARGS.test_csv)
+    main("train.csv", "test.csv")
