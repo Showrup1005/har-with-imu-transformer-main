@@ -309,6 +309,18 @@ class Strategy(fl.server.strategy.FedAvg):
         self.total_transform_time_sec = 0.0
         self.total_reconstruct_time_sec = 0.0
 
+        # Per-round history -- populated in aggregate_fit(), consumed by
+        # save_run_data(). This is our own tracking dict, distinct from
+        # Flower's internal server-side History object (which this
+        # Strategy instance has no access to).
+        self.history = {
+            "round": [],
+            "accuracy": [],
+            "num_bits": [],
+            "comm_dense_bytes": [],
+            "comm_no_compression_bytes": [],
+        }
+
     def _num_bits_for_round(self, server_round):
         frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
         cos = 0.5 * (1 + np.cos(np.pi * frac))
@@ -386,6 +398,13 @@ class Strategy(fl.server.strategy.FedAvg):
         avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
         self.total_transform_time_sec += avg_transform_time
         self.total_reconstruct_time_sec += round_reconstruct_time_sec
+
+        # Record this round in our own history dict (see __init__).
+        self.history["round"].append(server_round)
+        self.history["accuracy"].append(acc)
+        self.history["num_bits"].append(self._current_num_bits)
+        self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
+        self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
 
         compression_vs_baseline = (
             round_comm_dense_bytes / round_comm_no_compression_bytes
