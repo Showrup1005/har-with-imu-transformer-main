@@ -378,7 +378,7 @@ class Strategy(fl.server.strategy.FedAvg):
         self.global_model.load_state_dict(new_state)
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
 
-        acc = self.evaluate_global(final=False)
+        acc, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro = self.evaluate_global(final=False)
         avg_reg = float(np.mean(reg_losses)) if reg_losses else 0.0
 
         self.total_comm_dense_bytes += round_comm_dense_bytes
