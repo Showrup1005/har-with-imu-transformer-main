@@ -113,18 +113,15 @@ LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
 USE_COMPRESSION = True
-USE_STABILITY_REG = False
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
-STABILITY_LAMBDA = 0.01
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
 print(f"Seed: {SEED}")
 print(f"Compression strategy: FGMP (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
-      f"stability_reg={USE_STABILITY_REG} | "
       f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
-      f"keep_ratio=1.0 always | stability_lambda={STABILITY_LAMBDA}")
+      f"keep_ratio=1.0 always")
 
 
 # ====================== DATA ======================
@@ -185,23 +182,10 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_compression = fit_config.get("use_compression", USE_COMPRESSION)
-        use_stability_reg = fit_config.get("use_stability_reg", USE_STABILITY_REG)
         num_bits = int(fit_config.get("num_bits", NUM_BITS_START))
-        stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
 
         self.model.train()
         total_loss = 0.0
-        total_reg_loss = 0.0
-
-        # Fisher is kept ONLY for the stability regularizer now -- it no
-        # longer decides who gets dropped or who gets high/low precision,
-        # since nobody is dropped and there's no tier to assign.
-        fisher_accum = {
-            name: torch.zeros_like(p)
-            for name, p in self.model.named_parameters()
-            if p.requires_grad
-        }
-        n_grad_steps = 0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -210,27 +194,11 @@ class IMUClient(fl.client.NumPyClient):
 
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
-                ce_loss = self.criterion(output, label)
-
-                reg_loss = torch.zeros((), device=DEVICE)
-                if use_stability_reg and stability_lambda > 0 and n_grad_steps > 0:
-                    for name, p in self.model.named_parameters():
-                        if name in fisher_accum:
-                            f_running = (fisher_accum[name] / n_grad_steps).detach()
-                            reg_loss = reg_loss + (f_running * (p - old_state[name]) ** 2).sum()
-
-                loss = ce_loss + stability_lambda * reg_loss
+                loss = self.criterion(output, label)
                 loss.backward()
 
-                if use_stability_reg:
-                    for name, p in self.model.named_parameters():
-                        if p.grad is not None and name in fisher_accum:
-                            fisher_accum[name] += p.grad.detach() ** 2
-                n_grad_steps += 1
-
                 self.optimizer.step()
-                total_loss += ce_loss.item()
-                total_reg_loss += float(reg_loss.detach().item())
+                total_loss += loss.item()
 
         new_state = self.model.state_dict()
 
@@ -265,7 +233,6 @@ class IMUClient(fl.client.NumPyClient):
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
-            "avg_reg_loss": total_reg_loss / len(self.train_loader),
             "compression_meta": json.dumps(meta),
             "comm_dense_bytes": comm_dense_bytes,
             "comm_no_compression_bytes": comm_no_compression_bytes,
@@ -291,18 +258,15 @@ class IMUClient(fl.client.NumPyClient):
 
 # ====================== STRATEGY ======================
 class Strategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, use_compression=USE_COMPRESSION, use_stability_reg=USE_STABILITY_REG,
-                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END,
-                 stability_lambda=STABILITY_LAMBDA, **kwargs):
+    def __init__(self, test_loader, use_compression=USE_COMPRESSION,
+                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
         self.use_compression = use_compression
-        self.use_stability_reg = use_stability_reg
         self.num_bits_start = num_bits_start
         self.num_bits_end = num_bits_end
-        self.stability_lambda = stability_lambda
 
         self.total_comm_dense_bytes = 0
         self.total_comm_no_compression_bytes = 0
@@ -332,9 +296,7 @@ class Strategy(fl.server.strategy.FedAvg):
         num_bits = self._num_bits_for_round(server_round)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_compression"] = self.use_compression
-            fit_ins.config["use_stability_reg"] = self.use_stability_reg
             fit_ins.config["num_bits"] = num_bits
-            fit_ins.config["stability_lambda"] = self.stability_lambda
         self._current_num_bits = num_bits
         return fit_ins_list
 
@@ -346,7 +308,6 @@ class Strategy(fl.server.strategy.FedAvg):
         keys = list(global_state.keys())
         weighted_deltas = {k: np.zeros(v.shape, dtype=np.float64) for k, v in global_state.items()}
         total_examples = 0
-        reg_losses = []
 
         round_comm_dense_bytes = 0
         round_comm_no_compression_bytes = 0
@@ -357,7 +318,6 @@ class Strategy(fl.server.strategy.FedAvg):
             arrays = parameters_to_ndarrays(fit_res.parameters)
             num_examples = fit_res.num_examples
             meta = json.loads(fit_res.metrics.get("compression_meta", "[]"))
-            reg_losses.append(fit_res.metrics.get("avg_reg_loss", 0.0))
 
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
             round_comm_no_compression_bytes += fit_res.metrics.get("comm_no_compression_bytes", 0)
@@ -391,7 +351,6 @@ class Strategy(fl.server.strategy.FedAvg):
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
 
         acc, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro = self.evaluate_global(final=False)
-        avg_reg = float(np.mean(reg_losses)) if reg_losses else 0.0
 
         self.total_comm_dense_bytes += round_comm_dense_bytes
         self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
@@ -410,8 +369,7 @@ class Strategy(fl.server.strategy.FedAvg):
             round_comm_dense_bytes / round_comm_no_compression_bytes
             if round_comm_no_compression_bytes else 1.0
         )
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits} | "
-      f"stability_reg={self.use_stability_reg} | avg_reg_loss: {avg_reg:.5f}")
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
         print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
@@ -524,10 +482,8 @@ def main(train_csv: str, test_csv: str):
     strategy = Strategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
-        use_stability_reg=USE_STABILITY_REG,
         num_bits_start=NUM_BITS_START,
         num_bits_end=NUM_BITS_END,
-        stability_lambda=STABILITY_LAMBDA,
     )
 
     print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
