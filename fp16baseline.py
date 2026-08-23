@@ -2,6 +2,7 @@ import flwr as fl
 import torch
 import numpy as np
 import json
+import time
 import warnings
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
@@ -192,13 +193,24 @@ class IMUClient(fl.client.NumPyClient):
                 self.optimizer.step()
                 total_loss += loss.item()
 
+        _t0 = time.perf_counter()
         updated_params = self.get_parameters()  # fp16-quantized, as before
+        transform_time_sec = time.perf_counter() - _t0
+
         upload_bytes = compute_ndarrays_size(updated_params)
+        # what this same delta would have cost at full fp32 precision --
+        # fp16 halves every element vs. fp32, so this is exactly 2x the
+        # actual wire size. Kept as an explicit dequantize+measure (rather
+        # than upload_bytes * 2) so it stays correct if the dtype ever changes.
+        comm_no_compression_bytes = compute_ndarrays_size(dequantize_to_fp32(updated_params))
 
         return updated_params, len(self.train_loader.dataset), {
             "train_loss": total_loss / len(self.train_loader),
             "download_bytes": download_bytes,
             "upload_bytes": upload_bytes,
+            "comm_dense_bytes": upload_bytes,
+            "comm_no_compression_bytes": comm_no_compression_bytes,
+            "transform_time_sec": transform_time_sec,
         }
 
     def evaluate(self, parameters, config):
@@ -231,13 +243,19 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         self.total_download_bytes = 0
         self.total_upload_bytes = 0
+        self.total_comm_dense_bytes = 0
+        self.total_comm_no_compression_bytes = 0
+        self.total_transform_time_sec = 0.0
+        self.total_reconstruct_time_sec = 0.0
 
         # Per-round history -- populated in aggregate_fit(), consumed by
-        # save_run_data(). Mirrors the FGMP script's tracking dict so the
-        # two runs can be compared/plotted the same way.
+        # save_run_data().
         self.history = {
             "round": [],
             "accuracy": [],
+            "num_bits": [],
+            "comm_dense_bytes": [],
+            "comm_no_compression_bytes": [],
             "download_bytes": [],
             "upload_bytes": [],
         }
@@ -256,18 +274,26 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         round_download = 0
         round_upload = 0
+        round_comm_dense_bytes = 0
+        round_comm_no_compression_bytes = 0
+        round_transform_time_sec = []
+        round_reconstruct_time_sec = 0.0
         for _, fit_res in results:
             metrics = fit_res.metrics
             round_download += metrics.get("download_bytes", 0)
             round_upload += metrics.get("upload_bytes", 0)
+            round_comm_dense_bytes += metrics.get("comm_dense_bytes", 0)
+            round_comm_no_compression_bytes += metrics.get("comm_no_compression_bytes", 0)
+            round_transform_time_sec.append(metrics.get("transform_time_sec", 0.0))
         comm_tracker.log_round(server_round, round_download, round_upload)
 
-        # upcast each client's returned fp16 parameters back to fp32
-        # BEFORE FedAvg's weighted averaging runs -- unchanged.
+        
+        _recon_start = time.perf_counter()
         for _, fit_res in results:
             ndarrays = parameters_to_ndarrays(fit_res.parameters)
             ndarrays_fp32 = dequantize_to_fp32(ndarrays)
             fit_res.parameters = ndarrays_to_parameters(ndarrays_fp32)
+        round_reconstruct_time_sec += time.perf_counter() - _recon_start
 
         aggregated = super().aggregate_fit(server_round, results, failures)
 
@@ -287,14 +313,30 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
 
         self.total_download_bytes += round_download
         self.total_upload_bytes += round_upload
+        self.total_comm_dense_bytes += round_comm_dense_bytes
+        self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
+        avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
+        self.total_transform_time_sec += avg_transform_time
+        self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
         # Record this round in our own history dict (see __init__).
         self.history["round"].append(server_round)
         self.history["accuracy"].append(acc)
+        self.history["num_bits"].append(16)
+        self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
+        self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
         self.history["download_bytes"].append(round_download)
         self.history["upload_bytes"].append(round_upload)
 
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f}")
+        compression_vs_baseline = (
+            round_comm_dense_bytes / round_comm_no_compression_bytes
+            if round_comm_no_compression_bytes else 1.0
+        )
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits=16")
+        print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
+              f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
+        print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
+              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
 
         if acc > self.best_acc:
             self.best_acc = acc
@@ -320,9 +362,16 @@ class SaveModelStrategy(fl.server.strategy.FedAvg):
             "final_probs": getattr(self, "_final_all_probs", np.array([])),
             "total_download_bytes": self.total_download_bytes,
             "total_upload_bytes": self.total_upload_bytes,
+            "total_comm_dense_bytes": self.total_comm_dense_bytes,
+            "total_comm_no_compression_bytes": self.total_comm_no_compression_bytes,
+            "total_transform_time_sec": self.total_transform_time_sec,
+            "total_reconstruct_time_sec": self.total_reconstruct_time_sec,
             "best_acc": self.best_acc,
             "num_rounds": NUM_ROUNDS,
             "num_clients": NUM_CLIENTS,
+            "use_compression": True,
+            "num_bits_start": 16,
+            "num_bits_end": 16,
         })
 
         np.savez(path, **save_kwargs)
