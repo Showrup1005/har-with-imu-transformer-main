@@ -116,7 +116,7 @@ NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
-USE_COMPRESSION = False
+USE_COMPRESSION = True
 USE_STABILITY_REG = False
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
