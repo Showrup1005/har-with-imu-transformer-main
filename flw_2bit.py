@@ -180,7 +180,7 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_compression = fit_config.get("use_compression", USE_COMPRESSION)
-        num_bits = int(fit_config.get("num_bits", NUM_BITS_START))
+        num_bits = int(fit_config.get("num_bits", NUM_BITS))
 
         self.model.train()
         total_loss = 0.0
