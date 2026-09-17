@@ -113,15 +113,13 @@ LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
 USE_COMPRESSION = True
-NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
-NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
+NUM_BITS = 2              # fixed precision every round
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
 print(f"Seed: {SEED}")
 print(f"Compression strategy: Fed-CAUQ (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
-      f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
-      f"keep_ratio=1.0 always")
+      f"num_bits={NUM_BITS} (fixed) | keep_ratio=1.0 always")
 
 
 # ====================== DATA ======================
@@ -259,14 +257,13 @@ class IMUClient(fl.client.NumPyClient):
 # ====================== STRATEGY ======================
 class Strategy(fl.server.strategy.FedAvg):
     def __init__(self, test_loader, use_compression=USE_COMPRESSION,
-                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END, **kwargs):
+                 num_bits=NUM_BITS, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
         self.use_compression = use_compression
-        self.num_bits_start = num_bits_start
-        self.num_bits_end = num_bits_end
+        self.num_bits = num_bits
 
         self.total_comm_dense_bytes = 0
         self.total_comm_no_compression_bytes = 0
@@ -286,10 +283,7 @@ class Strategy(fl.server.strategy.FedAvg):
         }
 
     def _num_bits_for_round(self, server_round):
-        frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
-        cos = 0.5 * (1 + np.cos(np.pi * frac))
-        bits = self.num_bits_end + (self.num_bits_start - self.num_bits_end) * cos
-        return int(max(1, round(bits)))
+        return self.num_bits
 
     def configure_fit(self, server_round, parameters, client_manager):
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
@@ -402,8 +396,7 @@ class Strategy(fl.server.strategy.FedAvg):
             "num_rounds": NUM_ROUNDS,
             "num_clients": NUM_CLIENTS,
             "use_compression": self.use_compression,
-            "num_bits_start": self.num_bits_start,
-            "num_bits_end": self.num_bits_end,
+            "num_bits": self.num_bits,
         })
 
         np.savez(path, **save_kwargs)
@@ -482,8 +475,7 @@ def main(train_csv: str, test_csv: str):
     strategy = Strategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
-        num_bits_start=NUM_BITS_START,
-        num_bits_end=NUM_BITS_END,
+        num_bits=NUM_BITS,
     )
 
     print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")

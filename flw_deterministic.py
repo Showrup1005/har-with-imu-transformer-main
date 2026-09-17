@@ -45,18 +45,13 @@ class mp:
 
     @staticmethod
     def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int) -> np.ndarray:
-        """Stochastic-rounding quantization -- unbiased in expectation, which
-        matters more here since we're now quantizing every single element
-        (no high-precision safety net for a protected subset)."""
+        """Deterministic (round-to-nearest) quantization."""
         if x.size == 0:
             return x.astype(np.float32)
         qmax = 2 ** num_bits - 1
         step = scale / qmax if scale != 0 else 1.0
         x_scaled = (x - zmin) / step
-        floor = np.floor(x_scaled)
-        prob = np.clip(x_scaled - floor, 0.0, 1.0)
-        rnd = np.random.rand(*x.shape)
-        x_q = floor + (rnd < prob)
+        x_q = np.round(x_scaled)
         return np.clip(x_q, 0, qmax).astype(np.float64)
 
     @staticmethod
