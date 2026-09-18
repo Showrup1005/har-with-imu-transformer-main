@@ -113,7 +113,7 @@ LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
 USE_COMPRESSION = True
-NUM_BITS = 2              # fixed precision every round
+NUM_BITS = 3              # fixed precision every round
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
