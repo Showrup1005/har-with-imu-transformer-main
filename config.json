@@ -6,9 +6,9 @@
 
   "task_type": "seq-to-one",
   "input_dim": 11,
-  "window_size": 96,
+  "window_size": 128,
   "num_classes": 18,
-  "window_shift": 128,
+  "window_shift": 96,
   "use_baseline": false,
 
   "encode_position": true,
