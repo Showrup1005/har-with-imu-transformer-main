@@ -245,8 +245,6 @@ class IMUClient(fl.client.NumPyClient):
         comm_dense_bytes = 0
         comm_no_compression_bytes = 0
         transform_time_sec = 0.0
-        quant_err_sq = 0.0   # ||dequant(quant(x)) - x||^2 in transmitted units
-        delta_sq = 0.0       # ||w_new - w_old||^2 (true update size, same for every mode)
 
         for name, new_val in new_state.items():
             # ---- choose WHAT to transmit for this tensor ----
@@ -274,11 +272,6 @@ class IMUClient(fl.client.NumPyClient):
             payload = mp.encode(flat, num_bits, pack=bitpack)
             transform_time_sec += time.perf_counter() - _t0
 
-            # diagnostics (not timed): how much noise did quantization add?
-            _dec = mp.decode(payload).astype(np.float64)
-            quant_err_sq += float(np.sum((_dec - flat.astype(np.float64)) ** 2))
-            delta_sq += float(((new_val - old_state[name]).double() ** 2).sum().item())
-
             out_arrays.append(payload["packed"])
             meta.append({
                 "encoded": True, "kind": kind, "shape": list(arr.shape), "size": payload["n"],
@@ -293,8 +286,6 @@ class IMUClient(fl.client.NumPyClient):
             "comm_dense_bytes": comm_dense_bytes,
             "comm_no_compression_bytes": comm_no_compression_bytes,
             "transform_time_sec": transform_time_sec,
-            "quant_err_sq": quant_err_sq,
-            "delta_sq": delta_sq,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
 
@@ -350,7 +341,6 @@ class Strategy(fl.server.strategy.FedAvg):
             "num_bits": [],
             "comm_dense_bytes": [],
             "comm_no_compression_bytes": [],
-            "noise_to_update": [],
         }
 
     def _num_bits_for_round(self, server_round):
@@ -384,8 +374,6 @@ class Strategy(fl.server.strategy.FedAvg):
         round_comm_no_compression_bytes = 0
         round_transform_time_sec = []
         round_reconstruct_time_sec = 0.0
-        round_err_sq = 0.0
-        round_delta_sq = 0.0
 
         for _, fit_res in results:
             arrays = parameters_to_ndarrays(fit_res.parameters)
@@ -395,8 +383,6 @@ class Strategy(fl.server.strategy.FedAvg):
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
             round_comm_no_compression_bytes += fit_res.metrics.get("comm_no_compression_bytes", 0)
             round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
-            round_err_sq += fit_res.metrics.get("quant_err_sq", 0.0)
-            round_delta_sq += fit_res.metrics.get("delta_sq", 0.0)
 
             _recon_start = time.perf_counter()
             cursor = 0
@@ -456,12 +442,6 @@ class Strategy(fl.server.strategy.FedAvg):
         self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
         self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
 
-        # Quantization noise as it lands in WEIGHT space, relative to the true update size.
-        # (grad mode: transmitted error is scaled by server_lr when applied)
-        lr_scale = self.server_lr if self.update_mode == "grad" else 1.0
-        noise_to_update = (lr_scale * np.sqrt(round_err_sq) / np.sqrt(round_delta_sq)) if round_delta_sq > 0 else float("nan")
-        self.history["noise_to_update"].append(noise_to_update)
-
         compression_vs_baseline = (
             round_comm_dense_bytes / round_comm_no_compression_bytes
             if round_comm_no_compression_bytes else 1.0
@@ -469,7 +449,6 @@ class Strategy(fl.server.strategy.FedAvg):
         print(f"Round {server_round}/{NUM_ROUNDS} [{self.run_tag}] - Accuracy: {acc:.4f} | num_bits={self._current_num_bits}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
-        print(f"  [quant] noise/update ratio: {noise_to_update:.3f}  (>1 means quantization noise exceeds the real update)")
         print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
               f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
 
