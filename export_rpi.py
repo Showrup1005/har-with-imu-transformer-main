@@ -108,7 +108,7 @@ np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-NUM_CLIENTS = 3
+NUM_CLIENTS = 5
 LOCAL_EPOCHS = 5
 NUM_ROUNDS = 40
 
