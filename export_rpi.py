@@ -1,582 +1,128 @@
-import argparse
-import flwr as fl
-import torch
 import numpy as np
-import json
-import time
-import warnings
-from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import train_test_split
-import seaborn as sns
 import matplotlib.pyplot as plt
-
-warnings.filterwarnings("ignore")
-
-from models.IMUTransformerEncoder import IMUTransformerEncoder
-from util.IMUDataset import IMUDataset
-from flwr.common import ndarrays_to_parameters, parameters_to_ndarrays
-
-
-# ====================== ARGS ======================
-def parse_args():
-    parser = argparse.ArgumentParser(description="FL baseline")
-    parser.add_argument("--seed", type=int, default=42,
-                         help="Random seed for torch/numpy/CUDA and the client data split (default: 42)")
-    parser.add_argument("--train_csv", type=str, default="train.csv")
-    parser.add_argument("--test_csv", type=str, default="test.csv")
-    args, _unknown = parser.parse_known_args()
-    return args
-
-
-ARGS = parse_args()
-SEED = ARGS.seed
-
-
-# ====================== UNIFORM-PRECISION QUANT HELPERS ======================
-class mp:
-    @staticmethod
-    def compute_quant_params(x: np.ndarray):
-        if x.size == 0:
-            return 1.0, 0.0
-        x_min, x_max = float(x.min()), float(x.max())
-        if x_max == x_min:
-            return 1.0, x_min
-        return x_max - x_min, x_min
-
-    @staticmethod
-    def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int) -> np.ndarray:
-        """Stochastic-rounding quantization -- unbiased in expectation, which
-        matters more here since we're now quantizing every single element
-        (no high-precision safety net for a protected subset)."""
-        if x.size == 0:
-            return x.astype(np.float32)
-        qmax = 2 ** num_bits - 1
-        step = scale / qmax if scale != 0 else 1.0
-        x_scaled = (x - zmin) / step
-        floor = np.floor(x_scaled)
-        prob = np.clip(x_scaled - floor, 0.0, 1.0)
-        rnd = np.random.rand(*x.shape)
-        x_q = floor + (rnd < prob)
-        return np.clip(x_q, 0, qmax).astype(np.float64)
-
-    @staticmethod
-    def dequantize_with_params(x_q: np.ndarray, scale: float, zmin: float, num_bits: int) -> np.ndarray:
-        qmax = 2 ** num_bits - 1
-        step = scale / qmax if scale != 0 else 1.0
-        return x_q.astype(np.float32) * step + zmin
-
-    @staticmethod
-    def pack_bits(values: np.ndarray, nbits: int) -> np.ndarray:
-        """Generic sub-byte bit-packer -- any width 1..8, not just nibbles."""
-        v = values.astype(np.uint32)
-        bit_planes = ((v[:, None] >> np.arange(nbits - 1, -1, -1)) & 1).astype(np.uint8)
-        return np.packbits(bit_planes.reshape(-1))
-
-    @staticmethod
-    def unpack_bits(packed: np.ndarray, n: int, nbits: int) -> np.ndarray:
-        total_bits = n * nbits
-        bits = np.unpackbits(packed)[:total_bits].reshape(n, nbits)
-        weights = (1 << np.arange(nbits - 1, -1, -1)).astype(np.uint32)
-        return (bits * weights).sum(axis=1).astype(np.uint32)
-
-    @staticmethod
-    def encode(delta_flat: np.ndarray, num_bits: int) -> dict:
-        """No selection, no dropping: every element goes through the same
-        num_bits quantizer. No mask/addr/submask needed -- decoder knows the
-        shape already, so 'which positions' is just 'all of them, in order'."""
-        n = delta_flat.size
-        scale, zmin = mp.compute_quant_params(delta_flat)
-        q = mp.quantize_with_params(delta_flat, scale, zmin, num_bits).astype(np.uint32)
-        packed = mp.pack_bits(q, num_bits)
-        return {"n": n, "num_bits": num_bits, "scale": float(scale), "zmin": float(zmin), "packed": packed}
-
-    @staticmethod
-    def decode(payload: dict) -> np.ndarray:
-        n = payload["n"]
-        nbits = payload["num_bits"]
-        q = mp.unpack_bits(payload["packed"], n, nbits)
-        return mp.dequantize_with_params(q, payload["scale"], payload["zmin"], nbits)
-
-
-# ====================== CONFIG ======================
-with open('config.json', 'r') as f:
-    config = json.load(f)
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-
-NUM_CLIENTS = 3
-LOCAL_EPOCHS = 5
-NUM_ROUNDS = 80
-
-# ---- Validation split + early stopping ----
-VAL_FRACTION = 0.1    # share of train.csv held out for validation (clients never see it)
-EARLY_STOPPING = True
-PATIENCE = 8          # rounds without val improvement before stopping
-MIN_DELTA = 1e-3      # minimum val-accuracy gain that counts as improvement
-RESTORE_BEST = True   # final test evaluation uses the best-val model, not the last one
-
-USE_COMPRESSION = True
-NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
-NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
-SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
-
-print(f"Using device: {DEVICE}")
-print(f"Seed: {SEED}")
-print(f"Compression strategy: Fed-CAUQ (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
-      f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
-      f"keep_ratio=1.0 always")
-print(f"Early stopping: enabled={EARLY_STOPPING} | patience={PATIENCE} | min_delta={MIN_DELTA} | "
-      f"val_fraction={VAL_FRACTION} | restore_best={RESTORE_BEST}")
-
-
-# ====================== DATA ======================
-def load_data(train_csv: str, test_csv: str):
-    train_dataset = IMUDataset(train_csv, config["window_size"], config["input_dim"], config["window_shift"])
-    test_dataset = IMUDataset(test_csv, config["window_size"], config["input_dim"], config["window_shift"])
-    print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
-    return train_dataset, test_dataset
-
-
-def split_train_val(train_dataset, val_fraction=VAL_FRACTION, seed=SEED):
-    """Stratified train/val split. Clients only ever see the train part."""
-    n = len(train_dataset)
-    labels = []
-    for i in range(n):
-        lab = train_dataset[i]['label']
-        labels.append(lab.item() if torch.is_tensor(lab) else lab)
-    labels = np.array(labels)
-    idx = np.arange(n)
-    try:
-        train_idx, val_idx = train_test_split(
-            idx, test_size=val_fraction, stratify=labels, random_state=seed)
-    except ValueError:  # a class with too few samples to stratify
-        train_idx, val_idx = train_test_split(
-            idx, test_size=val_fraction, random_state=seed)
-    print(f"Train/val split: {len(train_idx)} train | {len(val_idx)} val")
-    return np.sort(train_idx), np.sort(val_idx)
-
-
-def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
-    n = len(train_dataset)
-    indices = np.arange(n)
-    np.random.seed(seed)
-    np.random.shuffle(indices)
-
-    client_datasets = []
-    size = n // num_clients
-    print(f"\n=== Client Data Distribution (Seed={seed}) ===")
-    for i in range(num_clients):
-        start = i * size
-        end = start + size if i < num_clients - 1 else n
-        subset = Subset(train_dataset, indices[start:end])
-        client_datasets.append(subset)
-
-        labels = []
-        for idx in indices[start:end]:
-            sample = train_dataset[idx]
-            label = sample['label'].item() if torch.is_tensor(sample['label']) else sample['label']
-            labels.append(label)
-        unique, counts = np.unique(labels, return_counts=True)
-        dist = dict(zip(unique.tolist(), counts.tolist()))
-        print(f"Client {i} → {len(subset)} samples | Label distribution: {dist}")
-    print("=" * 60)
-    return client_datasets
-
-
-# ====================== CLIENT ======================
-class IMUClient(fl.client.NumPyClient):
-    def __init__(self, train_subset):
-        self.model = IMUTransformerEncoder(config).to(DEVICE)
-        self.train_loader = DataLoader(train_subset, batch_size=config["batch_size"], shuffle=True, num_workers=0)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config["lr"], weight_decay=config.get("weight_decay", 1e-4))
-        self.criterion = torch.nn.CrossEntropyLoss()
-
-    def get_parameters(self, config=None):
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
-
-    def set_parameters(self, parameters):
-        if hasattr(parameters, "tensors"):
-            params = parameters_to_ndarrays(parameters)
-        else:
-            params = parameters
-        state_dict = {k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), params)}
-        self.model.load_state_dict(state_dict, strict=True)
-
-    def fit(self, parameters, fit_config):
-        self.set_parameters(parameters)
-        old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
-
-        use_compression = fit_config.get("use_compression", USE_COMPRESSION)
-        num_bits = int(fit_config.get("num_bits", NUM_BITS_START))
-
-        self.model.train()
-        total_loss = 0.0
-
-        for _ in range(LOCAL_EPOCHS):
-            for batch in self.train_loader:
-                imu = batch["imu"].to(DEVICE).float()
-                label = batch["label"].to(DEVICE).long()
-
-                self.optimizer.zero_grad()
-                output = self.model({"imu": imu})
-                loss = self.criterion(output, label)
-                loss.backward()
-
-                self.optimizer.step()
-                total_loss += loss.item()
-
-        new_state = self.model.state_dict()
-
-        out_arrays = []
-        meta = []
-        comm_dense_bytes = 0
-        comm_no_compression_bytes = 0
-        transform_time_sec = 0.0
-
-        for name, new_val in new_state.items():
-            old_val = old_state[name]
-            delta = (new_val - old_val).cpu().numpy()
-            comm_no_compression_bytes += delta.astype(np.float32).nbytes
-
-            if (not use_compression or delta.size <= SMALL_TENSOR_FULL_SEND_THRESHOLD):
-                out_arrays.append(delta.astype(np.float32))
-                meta.append({"encoded": False, "shape": list(delta.shape), "size": int(delta.size)})
-                comm_dense_bytes += delta.astype(np.float32).nbytes
-                continue
-
-            _t0 = time.perf_counter()
-            delta_flat = delta.reshape(-1).astype(np.float32)
-            payload = mp.encode(delta_flat, num_bits)
-            transform_time_sec += time.perf_counter() - _t0
-
-            out_arrays.append(payload["packed"])
-            meta.append({
-                "encoded": True, "shape": list(delta.shape), "size": payload["n"],
-                "num_bits": payload["num_bits"], "scale": payload["scale"], "zmin": payload["zmin"],
-            })
-            comm_dense_bytes += payload["packed"].nbytes
-
-        metrics = {
-            "train_loss": total_loss / len(self.train_loader),
-            "compression_meta": json.dumps(meta),
-            "comm_dense_bytes": comm_dense_bytes,
-            "comm_no_compression_bytes": comm_no_compression_bytes,
-            "transform_time_sec": transform_time_sec,
-        }
-        return out_arrays, len(self.train_loader.dataset), metrics
-
-    def evaluate(self, parameters, eval_config):
-        self.set_parameters(parameters)
-        self.model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for batch in self.train_loader:
-                imu = batch["imu"].to(DEVICE).float()
-                label = batch["label"].to(DEVICE).long()
-                output = self.model({"imu": imu})
-                pred = output.argmax(dim=1)
-                all_preds.extend(pred.cpu().numpy())
-                all_labels.extend(label.cpu().numpy())
-        accuracy = accuracy_score(all_labels, all_preds)
-        return float(0.0), len(self.train_loader.dataset), {"accuracy": accuracy}
-
-
-# ====================== STRATEGY ======================
-class Strategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, val_loader, use_compression=USE_COMPRESSION,
-                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END, **kwargs):
-        super().__init__(**kwargs)
-        self.test_loader = test_loader
-        self.val_loader = val_loader
-        self.global_model = IMUTransformerEncoder(config).to(DEVICE)
-
-        # Best-model / early-stopping state (driven by VALIDATION accuracy only)
-        self.best_val_acc = 0.0
-        self.best_acc = 0.0          # test accuracy at the best-val round (for reporting)
-        self.best_round = None
-        self.best_state = None
-        self.epochs_no_improve = 0
-        self.stopped = False
-        self.stopped_round = None
-
-        self.use_compression = use_compression
-        self.num_bits_start = num_bits_start
-        self.num_bits_end = num_bits_end
-
-        self.total_comm_dense_bytes = 0
-        self.total_comm_no_compression_bytes = 0
-        self.total_transform_time_sec = 0.0
-        self.total_reconstruct_time_sec = 0.0
-
-        # Per-round history -- populated in aggregate_fit(), consumed by
-        # save_run_data(). This is our own tracking dict, distinct from
-        # Flower's internal server-side History object (which this
-        # Strategy instance has no access to).
-        self.history = {
-            "round": [],
-            "accuracy": [],        # test accuracy (logged only, not used for decisions)
-            "val_accuracy": [],    # validation accuracy (drives early stopping)
-            "num_bits": [],
-            "comm_dense_bytes": [],
-            "comm_no_compression_bytes": [],
-        }
-
-    def _num_bits_for_round(self, server_round):
-        frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
-        cos = 0.5 * (1 + np.cos(np.pi * frac))
-        bits = self.num_bits_end + (self.num_bits_start - self.num_bits_end) * cos
-        return int(max(1, round(bits)))
-
-    def configure_fit(self, server_round, parameters, client_manager):
-        if self.stopped:
-            return []   # no clients selected -> Flower skips the round
-        fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
-        num_bits = self._num_bits_for_round(server_round)
-        for _, fit_ins in fit_ins_list:
-            fit_ins.config["use_compression"] = self.use_compression
-            fit_ins.config["num_bits"] = num_bits
-        self._current_num_bits = num_bits
-        return fit_ins_list
-
-    def configure_evaluate(self, server_round, parameters, client_manager):
-        if self.stopped:
-            return []
-        return super().configure_evaluate(server_round, parameters, client_manager)
-
-    def aggregate_fit(self, server_round, results, failures):
-        if not results:
-            return None, {}
-
-        global_state = self.global_model.state_dict()
-        keys = list(global_state.keys())
-        weighted_deltas = {k: np.zeros(v.shape, dtype=np.float64) for k, v in global_state.items()}
-        total_examples = 0
-
-        round_comm_dense_bytes = 0
-        round_comm_no_compression_bytes = 0
-        round_transform_time_sec = []
-        round_reconstruct_time_sec = 0.0
-
-        for _, fit_res in results:
-            arrays = parameters_to_ndarrays(fit_res.parameters)
-            num_examples = fit_res.num_examples
-            meta = json.loads(fit_res.metrics.get("compression_meta", "[]"))
-
-            round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
-            round_comm_no_compression_bytes += fit_res.metrics.get("comm_no_compression_bytes", 0)
-            round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
-
-            _recon_start = time.perf_counter()
-            cursor = 0
-            for k, m in zip(keys, meta):
-                shape = tuple(m["shape"])
-                if not m["encoded"]:
-                    arr = arrays[cursor]; cursor += 1
-                    reconstructed = arr.reshape(shape)
-                else:
-                    packed = arrays[cursor]; cursor += 1
-                    payload = {
-                        "n": m["size"], "num_bits": m["num_bits"],
-                        "scale": m["scale"], "zmin": m["zmin"], "packed": packed,
-                    }
-                    reconstructed = mp.decode(payload).reshape(shape)
-
-                weighted_deltas[k] += reconstructed.astype(np.float64) * num_examples
-            round_reconstruct_time_sec += time.perf_counter() - _recon_start
-            total_examples += num_examples
-
-        new_state = {}
-        for k in keys:
-            avg_delta = weighted_deltas[k] / max(1, total_examples)
-            new_state[k] = global_state[k] + torch.tensor(avg_delta, dtype=global_state[k].dtype, device=global_state[k].device)
-
-        self.global_model.load_state_dict(new_state)
-        aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
-
-        # Validation drives all decisions; test accuracy is logged for the curves only.
-        val_acc = self.evaluate_global(self.val_loader)[0]
-        acc = self.evaluate_global(self.test_loader)[0]
-
-        self.total_comm_dense_bytes += round_comm_dense_bytes
-        self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
-        avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
-        self.total_transform_time_sec += avg_transform_time
-        self.total_reconstruct_time_sec += round_reconstruct_time_sec
-
-        # Record this round in our own history dict (see __init__).
-        self.history["round"].append(server_round)
-        self.history["accuracy"].append(acc)
-        self.history["val_accuracy"].append(val_acc)
-        self.history["num_bits"].append(self._current_num_bits)
-        self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
-        self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
-
-        compression_vs_baseline = (
-            round_comm_dense_bytes / round_comm_no_compression_bytes
-            if round_comm_no_compression_bytes else 1.0
-        )
-        print(f"Round {server_round}/{NUM_ROUNDS} - Val: {val_acc:.4f} | Test: {acc:.4f} | num_bits={self._current_num_bits}")
-        print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
-              f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
-        print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
-              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
-
-        # ---- Best-model tracking + early stopping (validation only) ----
-        improved = val_acc > self.best_val_acc + MIN_DELTA
-        self.epochs_no_improve = 0 if improved else self.epochs_no_improve + 1
-
-        if val_acc > self.best_val_acc:
-            self.best_val_acc = val_acc
-            self.best_acc = acc
-            self.best_round = server_round
-            self.best_state = {k: v.clone() for k, v in self.global_model.state_dict().items()}
-            torch.save(self.best_state, f"best_model_seed{SEED}.pth")
-
-        stop_now = (EARLY_STOPPING and self.epochs_no_improve >= PATIENCE
-                    and server_round < NUM_ROUNDS)
-        if stop_now:
-            self.stopped = True
-            self.stopped_round = server_round
-            print(f"\n*** Early stopping at round {server_round}: val acc did not improve "
-                  f"by >{MIN_DELTA} for {PATIENCE} rounds "
-                  f"(best val {self.best_val_acc:.4f} at round {self.best_round}) ***")
-
-        if stop_now or server_round == NUM_ROUNDS:
-            if RESTORE_BEST and self.best_state is not None:
-                self.global_model.load_state_dict(self.best_state)
-                aggregated_params = ndarrays_to_parameters(
-                    [v.cpu().numpy() for v in self.global_model.state_dict().values()])
-            print("\n========== FINAL EVALUATION (test set) ==========")
-            self.evaluate_global(self.test_loader, final=True)
-            self.save_run_data()
-
-        return aggregated_params, {"accuracy": acc, "val_accuracy": val_acc,
-                                   "comm_dense_bytes": round_comm_dense_bytes}
-
-    def save_run_data(self, path="fl_run_history.npz"):
-        h = self.history
-        save_kwargs = {k: np.array(v) for k, v in h.items()}
-
-        save_kwargs.update({
-            "final_labels": getattr(self, "_final_all_labels", np.array([])),
-            "final_preds": getattr(self, "_final_all_preds", np.array([])),
-            "final_probs": getattr(self, "_final_all_probs", np.array([])),
-            "total_comm_dense_bytes": self.total_comm_dense_bytes,
-            "total_comm_no_compression_bytes": self.total_comm_no_compression_bytes,
-            "total_transform_time_sec": self.total_transform_time_sec,
-            "total_reconstruct_time_sec": self.total_reconstruct_time_sec,
-            "best_acc": self.best_acc,
-            "best_val_acc": self.best_val_acc,
-            "best_round": -1 if self.best_round is None else self.best_round,
-            "stopped_round": -1 if self.stopped_round is None else self.stopped_round,
-            "num_rounds": NUM_ROUNDS,
-            "num_clients": NUM_CLIENTS,
-            "use_compression": self.use_compression,
-            "num_bits_start": self.num_bits_start,
-            "num_bits_end": self.num_bits_end,
-        })
-
-        np.savez(path, **save_kwargs)
-        print(f"Saved run data to {path}")
-
-    def evaluate_global(self, loader, final=False):
-        self.global_model.eval()
-        all_preds, all_labels, all_probs = [], [], []
-        with torch.no_grad():
-            for batch in loader:
-                imu = batch["imu"].to(DEVICE).float()
-                labels = batch["label"].to(DEVICE).long()
-                outputs = self.global_model({"imu": imu})
-                probs = torch.softmax(outputs, dim=1)
-                preds = outputs.argmax(dim=1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs.cpu().numpy())
-
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        all_probs = np.array(all_probs)
-
-        accuracy = accuracy_score(all_labels, all_preds)
-        precision_w = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
-        recall_w = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
-        f1_w = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-        precision_m = precision_score(all_labels, all_preds, average="macro", zero_division=0)
-        recall_m = recall_score(all_labels, all_preds, average="macro", zero_division=0)
-        f1_m = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-
-        try:
-            from sklearn.preprocessing import label_binarize
-            from sklearn.metrics import roc_auc_score
-            classes = np.unique(all_labels)
-            y_onehot = label_binarize(all_labels, classes=classes)
-            auc_macro = roc_auc_score(y_onehot, all_probs, multi_class="ovr", average="macro")
-        except Exception:
-            auc_macro = float("nan")
-
-        if not final:
-            return accuracy, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro
-
-        # NO PLOTTING HERE ANYMORE -- just print the numbers and hand back raw arrays
-        print(f"Accuracy : {accuracy:.4f}")
-        print(f"Precision (weighted): {precision_w:.4f} | (macro): {precision_m:.4f}")
-        print(f"Recall    (weighted): {recall_w:.4f} | (macro): {recall_m:.4f}")
-        print(f"F1        (weighted): {f1_w:.4f} | (macro): {f1_m:.4f}")
-        print(f"ROC-AUC (macro, OvR): {auc_macro:.4f}")
-        print("\nClassification Report")
-        print(classification_report(all_labels, all_preds, zero_division=0))
-
-        self._final_all_labels = all_labels
-        self._final_all_preds = all_preds
-        self._final_all_probs = all_probs
-
-        return accuracy
-
-
-# ====================== MAIN ======================
-def main(train_csv: str, test_csv: str):
-    train_dataset, test_dataset = load_data(train_csv, test_csv)
-
-    # Hold out a validation set from the training data; clients only see the rest.
-    train_idx, val_idx = split_train_val(train_dataset)
-    train_subset = Subset(train_dataset, train_idx)
-    val_dataset = Subset(train_dataset, val_idx)
-
-    client_datasets = split_train_data(train_subset, NUM_CLIENTS, seed=SEED)
-    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
-
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-        client_idx = cid % len(client_datasets)
-        return IMUClient(client_datasets[client_idx]).to_client()
-
-    strategy = Strategy(
-        test_loader=test_loader,
-        val_loader=val_loader,
-        use_compression=USE_COMPRESSION,
-        num_bits_start=NUM_BITS_START,
-        num_bits_end=NUM_BITS_END,
-    )
-
-    print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
-
-if __name__ == "__main__":
-    main(ARGS.train_csv, ARGS.test_csv)
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.preprocessing import label_binarize
+
+# ---- Load the saved run data ----
+data = np.load("fl_run_history.npz")
+
+rounds = data["round"]
+num_rounds = int(data["num_rounds"]) if "num_rounds" in data.files else int(rounds.max())
+
+# Early-stopping info (absent in runs saved by the older script)
+best_round = int(data["best_round"]) if "best_round" in data.files else -1
+stopped_round = int(data["stopped_round"]) if "stopped_round" in data.files else -1
+
+# ================= communication cost vs. baseline =================
+plt.figure(figsize=(9, 5))
+dense_mb = data["comm_dense_bytes"] / 1e6
+baseline_mb = data["comm_no_compression_bytes"] / 1e6
+width = 0.4
+x = np.arange(len(rounds))
+plt.bar(x - width / 2, baseline_mb, width, label="No-compression baseline", color="#898781")
+plt.bar(x + width / 2, dense_mb, width, label="Actually sent", color="#2a78d6")
+tick_step = max(1, len(rounds) // 10)
+plt.xticks(x[::tick_step], [rounds[i] for i in range(0, len(rounds), tick_step)])
+plt.xlabel("Round"); plt.ylabel("MB per round")
+plt.title("Communication cost vs. no-compression baseline")
+plt.legend(); plt.tight_layout()
+plt.show()
+
+# ================= accuracy over rounds (val + test) =================
+plt.figure(figsize=(9, 4))
+if "val_accuracy" in data.files:
+    plt.plot(rounds, data["val_accuracy"], color="#1baf7a", linewidth=2, label="Validation (drives stopping)")
+plt.plot(rounds, data["accuracy"], color="#2a78d6", linewidth=2, label="Test (logged only)")
+if best_round > 0:
+    plt.axvline(best_round, color="#898781", linestyle=":", linewidth=1.5, label=f"Best-val round ({best_round})")
+if stopped_round > 0:
+    plt.axvline(stopped_round, color="#d62a2a", linestyle="--", linewidth=1.5, label=f"Early stop ({stopped_round})")
+plt.xlim(1, num_rounds)
+plt.xlabel("Round"); plt.ylabel("Accuracy"); plt.ylim(0, 1)
+plt.title("Global model accuracy over training rounds")
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.show()
+
+# ================= bit-width per round =================
+plt.figure(figsize=(9, 4))
+plt.step(rounds, data["num_bits"], where="post", color="#eb6834", linewidth=2)
+if stopped_round > 0:
+    plt.axvline(stopped_round, color="#d62a2a", linestyle="--", linewidth=1.5, label=f"Early stop ({stopped_round})")
+    plt.legend()
+plt.xlabel("Round"); plt.ylabel("Bits per element")
+plt.title("Quantization bit-width used per round")
+plt.tight_layout()
+plt.show()
+
+# ================= compute overhead =================
+plt.figure(figsize=(7, 4))
+overhead_totals = [float(data["total_transform_time_sec"]), float(data["total_reconstruct_time_sec"])]
+labels_ov = ["Client transform\n(encode)", "Server reconstruct\n(decode)"]
+plt.barh(labels_ov, overhead_totals, color=["#2a78d6", "#1baf7a"])
+plt.xlabel("Seconds, summed over the run")
+plt.title("Compute overhead: client vs. server")
+plt.tight_layout()
+plt.show()
+
+# ================= (bonus): quantization MSE over rounds =================
+if "quant_mse" in data.files:
+    plt.figure(figsize=(9, 4))
+    plt.plot(rounds, data["quant_mse"], color="#8a4fd8", linewidth=2)
+    plt.xlabel("Round"); plt.ylabel("Mean squared error")
+    plt.title("Quantization error over training rounds")
+    plt.tight_layout()
+    plt.show()
+
+# ================= Confusion matrix (raw + normalized) =================
+# These come from the final test evaluation (best-val model if RESTORE_BEST was on).
+if data["final_labels"].size > 0:
+    y_true = data["final_labels"]
+    y_pred = data["final_preds"]
+    y_probs = data["final_probs"]
+
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.title("Final Confusion Matrix (raw counts)")
+    plt.xlabel("Predicted"); plt.ylabel("True")
+    plt.show()
+
+    cm_norm = cm.astype(np.float64) / cm.sum(axis=1, keepdims=True)
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="Blues")
+    plt.title("Final Confusion Matrix (row-normalized)")
+    plt.xlabel("Predicted"); plt.ylabel("True")
+    plt.show()
+
+    # ================= ROC curves (one-vs-rest, per class) =================
+    classes = np.unique(y_true)
+    y_onehot = label_binarize(y_true, classes=classes)
+    plt.figure(figsize=(9, 8))
+    for i, c in enumerate(classes):
+        fpr, tpr, _ = roc_curve(y_onehot[:, i], y_probs[:, i])
+        plt.plot(fpr, tpr, label=f"Class {c} (AUC={auc(fpr, tpr):.2f})")
+    plt.plot([0, 1], [0, 1], "k--", linewidth=1)
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves (one-vs-rest, per class)")
+    plt.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+    plt.show()
+
+# ================= Summary =================
+if "best_val_acc" in data.files:
+    print(f"\nBest validation accuracy: {float(data['best_val_acc']):.4f} (round {best_round})")
+    print(f"Test accuracy at best-val round: {float(data['best_acc']):.4f}")
+else:
+    print(f"\nBest accuracy achieved: {float(data['best_acc']):.4f}")
+
+if stopped_round > 0:
+    print(f"Early stopped at round {stopped_round} of {num_rounds}")
+else:
+    print(f"Ran all {num_rounds} rounds (no early stop)")
+
+if data["total_comm_no_compression_bytes"] > 0:
+    ratio = float(data["total_comm_dense_bytes"]) / float(data["total_comm_no_compression_bytes"]) * 100
+    print(f"Real compression achieved: {ratio:.1f}% of no-compression baseline "
+          f"(over the {len(rounds)} rounds that ran)")
