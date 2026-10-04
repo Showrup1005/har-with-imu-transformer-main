@@ -130,9 +130,9 @@ np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-NUM_CLIENTS = 5
+NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 80
 
 USE_COMPRESSION = True
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
