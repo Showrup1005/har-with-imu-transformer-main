@@ -7,6 +7,7 @@ import time
 import warnings
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -108,9 +109,16 @@ np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-NUM_CLIENTS = 5
+NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 80
+
+# ---- Validation split + early stopping ----
+VAL_FRACTION = 0.1    # share of train.csv held out for validation (clients never see it)
+EARLY_STOPPING = True
+PATIENCE = 8          # rounds without val improvement before stopping
+MIN_DELTA = 1e-3      # minimum val-accuracy gain that counts as improvement
+RESTORE_BEST = True   # final test evaluation uses the best-val model, not the last one
 
 USE_COMPRESSION = True
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
@@ -122,6 +130,8 @@ print(f"Seed: {SEED}")
 print(f"Compression strategy: Fed-CAUQ (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
       f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
       f"keep_ratio=1.0 always")
+print(f"Early stopping: enabled={EARLY_STOPPING} | patience={PATIENCE} | min_delta={MIN_DELTA} | "
+      f"val_fraction={VAL_FRACTION} | restore_best={RESTORE_BEST}")
 
 
 # ====================== DATA ======================
@@ -130,6 +140,26 @@ def load_data(train_csv: str, test_csv: str):
     test_dataset = IMUDataset(test_csv, config["window_size"], config["input_dim"], config["window_shift"])
     print(f"Train samples: {len(train_dataset)} | Test samples: {len(test_dataset)}")
     return train_dataset, test_dataset
+
+
+def split_train_val(train_dataset, val_fraction=VAL_FRACTION, seed=SEED):
+    """Stratified train/val split. Clients only ever see the train part."""
+    n = len(train_dataset)
+    labels = []
+    for i in range(n):
+        lab = train_dataset[i]['label']
+        labels.append(lab.item() if torch.is_tensor(lab) else lab)
+    labels = np.array(labels)
+    idx = np.arange(n)
+    try:
+        train_idx, val_idx = train_test_split(
+            idx, test_size=val_fraction, stratify=labels, random_state=seed)
+    except ValueError:  # a class with too few samples to stratify
+        train_idx, val_idx = train_test_split(
+            idx, test_size=val_fraction, random_state=seed)
+    print(f"Train/val split: {len(train_idx)} train | {len(val_idx)} val")
+    return np.sort(train_idx), np.sort(val_idx)
+
 
 def split_train_data(train_dataset, num_clients=NUM_CLIENTS, seed=SEED):
     n = len(train_dataset)
@@ -258,12 +288,22 @@ class IMUClient(fl.client.NumPyClient):
 
 # ====================== STRATEGY ======================
 class Strategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, use_compression=USE_COMPRESSION,
+    def __init__(self, test_loader, val_loader, use_compression=USE_COMPRESSION,
                  num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
+        self.val_loader = val_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
-        self.best_acc = 0.0
+
+        # Best-model / early-stopping state (driven by VALIDATION accuracy only)
+        self.best_val_acc = 0.0
+        self.best_acc = 0.0          # test accuracy at the best-val round (for reporting)
+        self.best_round = None
+        self.best_state = None
+        self.epochs_no_improve = 0
+        self.stopped = False
+        self.stopped_round = None
+
         self.use_compression = use_compression
         self.num_bits_start = num_bits_start
         self.num_bits_end = num_bits_end
@@ -279,7 +319,8 @@ class Strategy(fl.server.strategy.FedAvg):
         # Strategy instance has no access to).
         self.history = {
             "round": [],
-            "accuracy": [],
+            "accuracy": [],        # test accuracy (logged only, not used for decisions)
+            "val_accuracy": [],    # validation accuracy (drives early stopping)
             "num_bits": [],
             "comm_dense_bytes": [],
             "comm_no_compression_bytes": [],
@@ -292,6 +333,8 @@ class Strategy(fl.server.strategy.FedAvg):
         return int(max(1, round(bits)))
 
     def configure_fit(self, server_round, parameters, client_manager):
+        if self.stopped:
+            return []   # no clients selected -> Flower skips the round
         fit_ins_list = super().configure_fit(server_round, parameters, client_manager)
         num_bits = self._num_bits_for_round(server_round)
         for _, fit_ins in fit_ins_list:
@@ -299,6 +342,11 @@ class Strategy(fl.server.strategy.FedAvg):
             fit_ins.config["num_bits"] = num_bits
         self._current_num_bits = num_bits
         return fit_ins_list
+
+    def configure_evaluate(self, server_round, parameters, client_manager):
+        if self.stopped:
+            return []
+        return super().configure_evaluate(server_round, parameters, client_manager)
 
     def aggregate_fit(self, server_round, results, failures):
         if not results:
@@ -350,7 +398,9 @@ class Strategy(fl.server.strategy.FedAvg):
         self.global_model.load_state_dict(new_state)
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
 
-        acc, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro = self.evaluate_global(final=False)
+        # Validation drives all decisions; test accuracy is logged for the curves only.
+        val_acc = self.evaluate_global(self.val_loader)[0]
+        acc = self.evaluate_global(self.test_loader)[0]
 
         self.total_comm_dense_bytes += round_comm_dense_bytes
         self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
@@ -361,6 +411,7 @@ class Strategy(fl.server.strategy.FedAvg):
         # Record this round in our own history dict (see __init__).
         self.history["round"].append(server_round)
         self.history["accuracy"].append(acc)
+        self.history["val_accuracy"].append(val_acc)
         self.history["num_bits"].append(self._current_num_bits)
         self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
         self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
@@ -369,22 +420,43 @@ class Strategy(fl.server.strategy.FedAvg):
             round_comm_dense_bytes / round_comm_no_compression_bytes
             if round_comm_no_compression_bytes else 1.0
         )
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits}")
+        print(f"Round {server_round}/{NUM_ROUNDS} - Val: {val_acc:.4f} | Test: {acc:.4f} | num_bits={self._current_num_bits}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
         print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
               f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
 
-        if acc > self.best_acc:
-            self.best_acc = acc
-            torch.save(self.global_model.state_dict(), f"best_model_seed{SEED}.pth")
+        # ---- Best-model tracking + early stopping (validation only) ----
+        improved = val_acc > self.best_val_acc + MIN_DELTA
+        self.epochs_no_improve = 0 if improved else self.epochs_no_improve + 1
 
-        if server_round == NUM_ROUNDS:
-            print("\n========== FINAL EVALUATION ==========")
-            self.evaluate_global(final=True)
+        if val_acc > self.best_val_acc:
+            self.best_val_acc = val_acc
+            self.best_acc = acc
+            self.best_round = server_round
+            self.best_state = {k: v.clone() for k, v in self.global_model.state_dict().items()}
+            torch.save(self.best_state, f"best_model_seed{SEED}.pth")
+
+        stop_now = (EARLY_STOPPING and self.epochs_no_improve >= PATIENCE
+                    and server_round < NUM_ROUNDS)
+        if stop_now:
+            self.stopped = True
+            self.stopped_round = server_round
+            print(f"\n*** Early stopping at round {server_round}: val acc did not improve "
+                  f"by >{MIN_DELTA} for {PATIENCE} rounds "
+                  f"(best val {self.best_val_acc:.4f} at round {self.best_round}) ***")
+
+        if stop_now or server_round == NUM_ROUNDS:
+            if RESTORE_BEST and self.best_state is not None:
+                self.global_model.load_state_dict(self.best_state)
+                aggregated_params = ndarrays_to_parameters(
+                    [v.cpu().numpy() for v in self.global_model.state_dict().values()])
+            print("\n========== FINAL EVALUATION (test set) ==========")
+            self.evaluate_global(self.test_loader, final=True)
             self.save_run_data()
 
-        return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
+        return aggregated_params, {"accuracy": acc, "val_accuracy": val_acc,
+                                   "comm_dense_bytes": round_comm_dense_bytes}
 
     def save_run_data(self, path="fl_run_history.npz"):
         h = self.history
@@ -399,6 +471,9 @@ class Strategy(fl.server.strategy.FedAvg):
             "total_transform_time_sec": self.total_transform_time_sec,
             "total_reconstruct_time_sec": self.total_reconstruct_time_sec,
             "best_acc": self.best_acc,
+            "best_val_acc": self.best_val_acc,
+            "best_round": -1 if self.best_round is None else self.best_round,
+            "stopped_round": -1 if self.stopped_round is None else self.stopped_round,
             "num_rounds": NUM_ROUNDS,
             "num_clients": NUM_CLIENTS,
             "use_compression": self.use_compression,
@@ -409,11 +484,11 @@ class Strategy(fl.server.strategy.FedAvg):
         np.savez(path, **save_kwargs)
         print(f"Saved run data to {path}")
 
-    def evaluate_global(self, final=False):
+    def evaluate_global(self, loader, final=False):
         self.global_model.eval()
         all_preds, all_labels, all_probs = [], [], []
         with torch.no_grad():
-            for batch in self.test_loader:
+            for batch in loader:
                 imu = batch["imu"].to(DEVICE).float()
                 labels = batch["label"].to(DEVICE).long()
                 outputs = self.global_model({"imu": imu})
@@ -456,9 +531,9 @@ class Strategy(fl.server.strategy.FedAvg):
         print("\nClassification Report")
         print(classification_report(all_labels, all_preds, zero_division=0))
 
-        self._final_all_labels = all_labels  
-        self._final_all_preds = all_preds     
-        self._final_all_probs = all_probs     
+        self._final_all_labels = all_labels
+        self._final_all_preds = all_preds
+        self._final_all_probs = all_probs
 
         return accuracy
 
@@ -466,7 +541,14 @@ class Strategy(fl.server.strategy.FedAvg):
 # ====================== MAIN ======================
 def main(train_csv: str, test_csv: str):
     train_dataset, test_dataset = load_data(train_csv, test_csv)
-    client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=SEED)
+
+    # Hold out a validation set from the training data; clients only see the rest.
+    train_idx, val_idx = split_train_val(train_dataset)
+    train_subset = Subset(train_dataset, train_idx)
+    val_dataset = Subset(train_dataset, val_idx)
+
+    client_datasets = split_train_data(train_subset, NUM_CLIENTS, seed=SEED)
+    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
     def client_fn(context):
@@ -481,6 +563,7 @@ def main(train_csv: str, test_csv: str):
 
     strategy = Strategy(
         test_loader=test_loader,
+        val_loader=val_loader,
         use_compression=USE_COMPRESSION,
         num_bits_start=NUM_BITS_START,
         num_bits_end=NUM_BITS_END,
