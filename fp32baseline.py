@@ -458,18 +458,6 @@ def main(train_csv: str, test_csv: str):
     print_model_size_summary(_tmp_model)
     del _tmp_model
 
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-
-        client_idx = cid % len(client_datasets)
-
-        return IMUClient(client_datasets[client_idx]).to_client()
-
     strategy = SaveModelStrategy(test_loader=test_loader)
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
@@ -479,19 +467,21 @@ def main(train_csv: str, test_csv: str):
     params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
 
     for rnd in range(1, NUM_ROUNDS + 1):
-        num_bits = strategy._num_bits_for_round(rnd)
-        strategy._current_num_bits = num_bits
         results = []
         for idx in range(NUM_CLIENTS):
-            c = IMUClient(client_datasets[idx])          # fresh client each round, as in the Ray version
-            arrays, n, metrics = c.fit(params, {"use_compression": USE_COMPRESSION, "num_bits": num_bits})
+            c = IMUClient(client_datasets[idx])   # fresh client each round
+            arrays, n, metrics = c.fit(params, {})
             results.append((None, FitRes(status=Status(Code.OK, "ok"),
-                                        parameters=ndarrays_to_parameters(arrays),
-                                        num_examples=n, metrics=metrics)))
+                                         parameters=ndarrays_to_parameters(arrays),
+                                         num_examples=n, metrics=metrics)))
             del c
             torch.cuda.empty_cache()
-        agg, _ = strategy.aggregate_fit(rnd, results, [])
-        params = parameters_to_ndarrays(agg)
+
+        agg = strategy.aggregate_fit(rnd, results, [])
+        if agg is None or agg[0] is None:
+            raise RuntimeError(f"Aggregation failed at round {rnd}")
+        params = parameters_to_ndarrays(agg[0])
+
 
 if __name__ == "__main__":
     main("train.csv", "test.csv")
