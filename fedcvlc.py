@@ -240,7 +240,7 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 70
 
 USE_COMPRESSION = True
 TOP_K_RATIO_START = 0.6     

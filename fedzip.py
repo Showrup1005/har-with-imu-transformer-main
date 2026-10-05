@@ -166,7 +166,7 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40          
+NUM_ROUNDS = 70          
 
 USE_COMPRESSION = True
 FEDZIP_TOP_Z_WEIGHT = 0.1   # keep top 10% of weight-tensor elements by magnitude
