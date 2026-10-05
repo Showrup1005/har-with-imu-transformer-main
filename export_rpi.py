@@ -110,7 +110,7 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 50
+NUM_ROUNDS = 60
 
 USE_COMPRESSION = True
 NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
