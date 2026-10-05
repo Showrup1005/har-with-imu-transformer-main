@@ -24,9 +24,9 @@ torch.manual_seed(42)
 np.random.seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
-NUM_CLIENTS = 5
+NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 70
 
 print(f"Using device: {DEVICE}")
 
@@ -474,13 +474,24 @@ def main(train_csv: str, test_csv: str):
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
+    from flwr.common import FitRes, Status, Code
+
+    params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        num_bits = strategy._num_bits_for_round(rnd)
+        strategy._current_num_bits = num_bits
+        results = []
+        for idx in range(NUM_CLIENTS):
+            c = IMUClient(client_datasets[idx])          # fresh client each round, as in the Ray version
+            arrays, n, metrics = c.fit(params, {"use_compression": USE_COMPRESSION, "num_bits": num_bits})
+            results.append((None, FitRes(status=Status(Code.OK, "ok"),
+                                        parameters=ndarrays_to_parameters(arrays),
+                                        num_examples=n, metrics=metrics)))
+            del c
+            torch.cuda.empty_cache()
+        agg, _ = strategy.aggregate_fit(rnd, results, [])
+        params = parameters_to_ndarrays(agg)
 
 if __name__ == "__main__":
     main("train.csv", "test.csv")
