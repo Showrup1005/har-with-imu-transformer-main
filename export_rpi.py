@@ -492,7 +492,7 @@ def main(train_csv: str, test_csv: str):
         num_clients=NUM_CLIENTS,
         config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
+        client_resources={"num_cpus": 1, "num_gpus": 1.0 if torch.cuda.is_available() else 0}
     )
 
 if __name__ == "__main__":
