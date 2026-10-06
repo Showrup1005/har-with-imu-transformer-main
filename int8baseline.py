@@ -503,38 +503,34 @@ def main(train_csv: str, test_csv: str):
 
     _tmp_model = IMUTransformerEncoder(config).to(DEVICE)
     print_model_size_summary(_tmp_model)
-
-    # build genuine fp32 initial parameters here, so Flower never falls
-    # back to asking a client for get_parameters() (which always returns
-    # int8+scales) to seed round 1.
-    initial_ndarrays = [val.cpu().numpy() for _, val in _tmp_model.state_dict().items()]
-    initial_parameters = ndarrays_to_parameters(initial_ndarrays)
     del _tmp_model
 
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-        client_idx = cid % len(client_datasets)
-        return IMUClient(client_datasets[client_idx]).to_client()
-
-    strategy = SaveModelStrategy(
-        test_loader=test_loader,
-        initial_parameters=initial_parameters,  # passed through **kwargs to FedAvg
-    )
+    strategy = SaveModelStrategy(test_loader=test_loader)
 
     print(f"Starting FL (int8 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
+    from flwr.common import FitRes, Status, Code
+
+    # fp32 master copy lives on the server; only the wire format is int8
+    params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        params_int8 = quantize_to_int8(params)   # what configure_fit did: int8 + scales download
+        results = []
+        for idx in range(NUM_CLIENTS):
+            c = IMUClient(client_datasets[idx])   # fresh client each round
+            arrays, n, metrics = c.fit(params_int8, {})
+            results.append((None, FitRes(status=Status(Code.OK, "ok"),
+                                         parameters=ndarrays_to_parameters(arrays),
+                                         num_examples=n, metrics=metrics)))
+            del c
+            torch.cuda.empty_cache()
+
+        agg = strategy.aggregate_fit(rnd, results, [])
+        if agg is None or agg[0] is None:
+            raise RuntimeError(f"Aggregation failed at round {rnd}")
+        params = parameters_to_ndarrays(agg[0])   # fp32: aggregate_fit dequantizes before FedAvg
+
 
 if __name__ == "__main__":
     main("train.csv", "test.csv")

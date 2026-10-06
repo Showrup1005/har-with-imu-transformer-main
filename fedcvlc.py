@@ -661,16 +661,6 @@ def main(train_csv: str, test_csv: str):
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=42)
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-        client_idx = cid % len(client_datasets)
-        return IMUClient(client_datasets[client_idx]).to_client()
-
     strategy = FedCVLCStrategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
@@ -679,13 +669,32 @@ def main(train_csv: str, test_csv: str):
     )
 
     print(f"Starting FL | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
+
+    from flwr.common import FitRes, Status, Code
+
+    params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        top_k_ratio = strategy._top_k_for_round(rnd)
+        strategy._current_top_k = top_k_ratio   # read by aggregate_fit for history/logging
+        results = []
+        for idx in range(NUM_CLIENTS):
+            c = IMUClient(client_datasets[idx])   # fresh client each round
+            arrays, n, metrics = c.fit(params, {
+                "use_compression": USE_COMPRESSION,
+                "top_k_ratio": top_k_ratio,
+            })
+            results.append((None, FitRes(status=Status(Code.OK, "ok"),
+                                         parameters=ndarrays_to_parameters(arrays),
+                                         num_examples=n, metrics=metrics)))
+            del c
+            torch.cuda.empty_cache()
+
+        agg = strategy.aggregate_fit(rnd, results, [])
+        if agg is None or agg[0] is None:
+            raise RuntimeError(f"Aggregation failed at round {rnd}")
+        params = parameters_to_ndarrays(agg[0])
+
 
 if __name__ == "__main__":
     main("train.csv", "test.csv")

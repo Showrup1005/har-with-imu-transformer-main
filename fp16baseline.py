@@ -458,29 +458,32 @@ def main(train_csv: str, test_csv: str):
     print_model_size_summary(_tmp_model)
     del _tmp_model
 
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-
-        client_idx = cid % len(client_datasets)
-
-        return IMUClient(client_datasets[client_idx]).to_client()
-
     strategy = SaveModelStrategy(test_loader=test_loader)
 
     print(f"Starting FL (fp16 quantized communication) | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
 
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
+    from flwr.common import FitRes, Status, Code
+
+    # fp32 master copy lives on the server; only the wire format is fp16
+    params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        params_fp16 = quantize_to_fp16(params)   # what configure_fit did: fp16 download
+        results = []
+        for idx in range(NUM_CLIENTS):
+            c = IMUClient(client_datasets[idx])   # fresh client each round
+            arrays, n, metrics = c.fit(params_fp16, {})
+            results.append((None, FitRes(status=Status(Code.OK, "ok"),
+                                         parameters=ndarrays_to_parameters(arrays),
+                                         num_examples=n, metrics=metrics)))
+            del c
+            torch.cuda.empty_cache()
+
+        agg = strategy.aggregate_fit(rnd, results, [])
+        if agg is None or agg[0] is None:
+            raise RuntimeError(f"Aggregation failed at round {rnd}")
+        params = parameters_to_ndarrays(agg[0])   # fp32, since aggregate_fit dequantizes first
+
 
 if __name__ == "__main__":
     main("train.csv", "test.csv")
