@@ -113,7 +113,7 @@ LOCAL_EPOCHS = 5
 NUM_ROUNDS = 70
 
 USE_COMPRESSION = True
-NUM_BITS = 3              # fixed precision every round
+NUM_BITS = 2              # fixed precision every round
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
@@ -462,16 +462,6 @@ def main(train_csv: str, test_csv: str):
     client_datasets = split_train_data(train_dataset, NUM_CLIENTS, seed=SEED)
     test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False)
 
-    def client_fn(context):
-        if hasattr(context, "node_id"):
-            cid = int(context.node_id)
-        elif hasattr(context, "node_config") and "cid" in context.node_config:
-            cid = int(context.node_config["cid"])
-        else:
-            cid = 0
-        client_idx = cid % len(client_datasets)
-        return IMUClient(client_datasets[client_idx]).to_client()
-
     strategy = Strategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
@@ -479,13 +469,32 @@ def main(train_csv: str, test_csv: str):
     )
 
     print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
+
+    from flwr.common import FitRes, Status, Code
+
+    params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        num_bits = strategy._num_bits_for_round(rnd)
+        strategy._current_num_bits = num_bits   # read by aggregate_fit for history/logging
+        results = []
+        for idx in range(NUM_CLIENTS):
+            c = IMUClient(client_datasets[idx])   # fresh client each round
+            arrays, n, metrics = c.fit(params, {
+                "use_compression": strategy.use_compression,
+                "num_bits": num_bits,
+            })
+            results.append((None, FitRes(status=Status(Code.OK, "ok"),
+                                         parameters=ndarrays_to_parameters(arrays),
+                                         num_examples=n, metrics=metrics)))
+            del c
+            torch.cuda.empty_cache()
+
+        agg = strategy.aggregate_fit(rnd, results, [])
+        if agg is None or agg[0] is None:
+            raise RuntimeError(f"Aggregation failed at round {rnd}")
+        params = parameters_to_ndarrays(agg[0])
+
 
 if __name__ == "__main__":
     main(ARGS.train_csv, ARGS.test_csv)
