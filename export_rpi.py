@@ -113,7 +113,7 @@ LOCAL_EPOCHS = 5
 NUM_ROUNDS = 70
 
 USE_COMPRESSION = False
-NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
+NUM_BITS_START = 5.0     # round 1: generous precision, nothing dropped
 NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
