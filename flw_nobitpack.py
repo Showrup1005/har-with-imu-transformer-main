@@ -34,8 +34,8 @@ def parse_args():
     parser.add_argument("--server_lr", type=float, default=1.0,
                         help="Server step size, only used when update_mode=grad "
                              "(w <- w - server_lr * avg_grad)")
-    parser.add_argument("--bits_start", type=float, default=4.0)
-    parser.add_argument("--bits_end", type=float, default=1.5)
+    parser.add_argument("--bits_start", type=float, default=3.0)
+    parser.add_argument("--bits_end", type=float, default=0.5)
 
     # ---- NEW: bit-packing ablation ----
     parser.add_argument("--no_bitpack", action="store_true",
