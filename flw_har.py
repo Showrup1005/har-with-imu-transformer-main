@@ -46,8 +46,7 @@ class mp:
     @staticmethod
     def quantize_with_params(x: np.ndarray, scale: float, zmin: float, num_bits: int) -> np.ndarray:
         """Stochastic-rounding quantization -- unbiased in expectation, which
-        matters more here since we're now quantizing every single element
-        (no high-precision safety net for a protected subset)."""
+        matters more here since we're now quantizing every single element."""
         if x.size == 0:
             return x.astype(np.float32)
         qmax = 2 ** num_bits - 1
@@ -110,21 +109,18 @@ if torch.cuda.is_available():
 
 NUM_CLIENTS = 3
 LOCAL_EPOCHS = 5
-NUM_ROUNDS = 40
+NUM_ROUNDS = 70
 
 USE_COMPRESSION = True
-USE_STABILITY_REG = False
-NUM_BITS_START = 4.0     # round 1: generous precision, nothing dropped
-NUM_BITS_END = 1.5       # final rounds: coarse but still nonzero for every element
-STABILITY_LAMBDA = 0.01
+NUM_BITS_START = 3.0     # round 1: generous precision, nothing dropped
+NUM_BITS_END = 0.5       # final rounds: coarse but still nonzero for every element
 SMALL_TENSOR_FULL_SEND_THRESHOLD = 4096   # cheap tensors still sent dense fp32
 
 print(f"Using device: {DEVICE}")
 print(f"Seed: {SEED}")
-print(f"Compression strategy: FGMP (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
-      f"stability_reg={USE_STABILITY_REG} | "
+print(f"Compression strategy: Fed-CAUQ (no-drop, uniform quant) | enabled={USE_COMPRESSION} | "
       f"num_bits {NUM_BITS_START}->{NUM_BITS_END} (cosine, rounded per round) | "
-      f"keep_ratio=1.0 always | stability_lambda={STABILITY_LAMBDA}")
+      f"keep_ratio=1.0 always")
 
 
 # ====================== DATA ======================
@@ -185,23 +181,10 @@ class IMUClient(fl.client.NumPyClient):
         old_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
         use_compression = fit_config.get("use_compression", USE_COMPRESSION)
-        use_stability_reg = fit_config.get("use_stability_reg", USE_STABILITY_REG)
         num_bits = int(fit_config.get("num_bits", NUM_BITS_START))
-        stability_lambda = fit_config.get("stability_lambda", STABILITY_LAMBDA)
 
         self.model.train()
         total_loss = 0.0
-        total_reg_loss = 0.0
-
-        # Fisher is kept ONLY for the stability regularizer now -- it no
-        # longer decides who gets dropped or who gets high/low precision,
-        # since nobody is dropped and there's no tier to assign.
-        fisher_accum = {
-            name: torch.zeros_like(p)
-            for name, p in self.model.named_parameters()
-            if p.requires_grad
-        }
-        n_grad_steps = 0
 
         for _ in range(LOCAL_EPOCHS):
             for batch in self.train_loader:
@@ -210,27 +193,11 @@ class IMUClient(fl.client.NumPyClient):
 
                 self.optimizer.zero_grad()
                 output = self.model({"imu": imu})
-                ce_loss = self.criterion(output, label)
-
-                reg_loss = torch.zeros((), device=DEVICE)
-                if use_stability_reg and stability_lambda > 0 and n_grad_steps > 0:
-                    for name, p in self.model.named_parameters():
-                        if name in fisher_accum:
-                            f_running = (fisher_accum[name] / n_grad_steps).detach()
-                            reg_loss = reg_loss + (f_running * (p - old_state[name]) ** 2).sum()
-
-                loss = ce_loss + stability_lambda * reg_loss
+                loss = self.criterion(output, label)
                 loss.backward()
 
-                if use_stability_reg:
-                    for name, p in self.model.named_parameters():
-                        if p.grad is not None and name in fisher_accum:
-                            fisher_accum[name] += p.grad.detach() ** 2
-                n_grad_steps += 1
-
                 self.optimizer.step()
-                total_loss += ce_loss.item()
-                total_reg_loss += float(reg_loss.detach().item())
+                total_loss += loss.item()
 
         new_state = self.model.state_dict()
 
@@ -265,7 +232,6 @@ class IMUClient(fl.client.NumPyClient):
 
         metrics = {
             "train_loss": total_loss / len(self.train_loader),
-            "avg_reg_loss": total_reg_loss / len(self.train_loader),
             "compression_meta": json.dumps(meta),
             "comm_dense_bytes": comm_dense_bytes,
             "comm_no_compression_bytes": comm_no_compression_bytes,
@@ -291,23 +257,32 @@ class IMUClient(fl.client.NumPyClient):
 
 # ====================== STRATEGY ======================
 class Strategy(fl.server.strategy.FedAvg):
-    def __init__(self, test_loader, use_compression=USE_COMPRESSION, use_stability_reg=USE_STABILITY_REG,
-                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END,
-                 stability_lambda=STABILITY_LAMBDA, **kwargs):
+    def __init__(self, test_loader, use_compression=USE_COMPRESSION,
+                 num_bits_start=NUM_BITS_START, num_bits_end=NUM_BITS_END, **kwargs):
         super().__init__(**kwargs)
         self.test_loader = test_loader
         self.global_model = IMUTransformerEncoder(config).to(DEVICE)
         self.best_acc = 0.0
         self.use_compression = use_compression
-        self.use_stability_reg = use_stability_reg
         self.num_bits_start = num_bits_start
         self.num_bits_end = num_bits_end
-        self.stability_lambda = stability_lambda
 
         self.total_comm_dense_bytes = 0
         self.total_comm_no_compression_bytes = 0
         self.total_transform_time_sec = 0.0
         self.total_reconstruct_time_sec = 0.0
+
+        # Per-round history -- populated in aggregate_fit(), consumed by
+        # save_run_data(). This is our own tracking dict, distinct from
+        # Flower's internal server-side History object (which this
+        # Strategy instance has no access to).
+        self.history = {
+            "round": [],
+            "accuracy": [],
+            "num_bits": [],
+            "comm_dense_bytes": [],
+            "comm_no_compression_bytes": [],
+        }
 
     def _num_bits_for_round(self, server_round):
         frac = (server_round - 1) / max(1, NUM_ROUNDS - 1)
@@ -320,9 +295,7 @@ class Strategy(fl.server.strategy.FedAvg):
         num_bits = self._num_bits_for_round(server_round)
         for _, fit_ins in fit_ins_list:
             fit_ins.config["use_compression"] = self.use_compression
-            fit_ins.config["use_stability_reg"] = self.use_stability_reg
             fit_ins.config["num_bits"] = num_bits
-            fit_ins.config["stability_lambda"] = self.stability_lambda
         self._current_num_bits = num_bits
         return fit_ins_list
 
@@ -334,7 +307,6 @@ class Strategy(fl.server.strategy.FedAvg):
         keys = list(global_state.keys())
         weighted_deltas = {k: np.zeros(v.shape, dtype=np.float64) for k, v in global_state.items()}
         total_examples = 0
-        reg_losses = []
 
         round_comm_dense_bytes = 0
         round_comm_no_compression_bytes = 0
@@ -345,7 +317,6 @@ class Strategy(fl.server.strategy.FedAvg):
             arrays = parameters_to_ndarrays(fit_res.parameters)
             num_examples = fit_res.num_examples
             meta = json.loads(fit_res.metrics.get("compression_meta", "[]"))
-            reg_losses.append(fit_res.metrics.get("avg_reg_loss", 0.0))
 
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
             round_comm_no_compression_bytes += fit_res.metrics.get("comm_no_compression_bytes", 0)
@@ -378,8 +349,7 @@ class Strategy(fl.server.strategy.FedAvg):
         self.global_model.load_state_dict(new_state)
         aggregated_params = ndarrays_to_parameters([v.cpu().numpy() for v in new_state.values()])
 
-        acc = self.evaluate_global(final=False)
-        avg_reg = float(np.mean(reg_losses)) if reg_losses else 0.0
+        acc, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro = self.evaluate_global(final=False)
 
         self.total_comm_dense_bytes += round_comm_dense_bytes
         self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
@@ -387,12 +357,18 @@ class Strategy(fl.server.strategy.FedAvg):
         self.total_transform_time_sec += avg_transform_time
         self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
+        # Record this round in our own history dict (see __init__).
+        self.history["round"].append(server_round)
+        self.history["accuracy"].append(acc)
+        self.history["num_bits"].append(self._current_num_bits)
+        self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
+        self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
+
         compression_vs_baseline = (
             round_comm_dense_bytes / round_comm_no_compression_bytes
             if round_comm_no_compression_bytes else 1.0
         )
-        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits} | "
-      f"stability_reg={self.use_stability_reg} | avg_reg_loss: {avg_reg:.5f}")
+        print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
         print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
@@ -405,60 +381,84 @@ class Strategy(fl.server.strategy.FedAvg):
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
-            self.print_overhead_summary()
+            self.save_run_data()
 
         return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
 
-    def print_overhead_summary(self):
-        print(f"\n========== OVERHEAD SUMMARY (FGMP, seed={SEED}, cumulative over the run) ==========")
-        print(f"Total communication ACTUALLY SENT  : {self.total_comm_dense_bytes/1e6:.2f} MB")
-        print(f"Total communication with NO compression (dense baseline): {self.total_comm_no_compression_bytes/1e6:.2f} MB")
-        if self.total_comm_no_compression_bytes:
-            print(f"  -> real compression achieved: {self.total_comm_dense_bytes/self.total_comm_no_compression_bytes*100:.1f}% "
-                  f"of no-compression baseline")
-        print(f"Total client-side transform time (encode, avg client, summed)  : {self.total_transform_time_sec:.2f}s")
-        print(f"Total server-side reconstruct time (decode+scatter, summed)   : {self.total_reconstruct_time_sec:.2f}s")
-        print(f"Best accuracy achieved: {self.best_acc:.4f}")
+    def save_run_data(self, path="fl_run_history.npz"):
+        h = self.history
+        save_kwargs = {k: np.array(v) for k, v in h.items()}
+
+        save_kwargs.update({
+            "final_labels": getattr(self, "_final_all_labels", np.array([])),
+            "final_preds": getattr(self, "_final_all_preds", np.array([])),
+            "final_probs": getattr(self, "_final_all_probs", np.array([])),
+            "total_comm_dense_bytes": self.total_comm_dense_bytes,
+            "total_comm_no_compression_bytes": self.total_comm_no_compression_bytes,
+            "total_transform_time_sec": self.total_transform_time_sec,
+            "total_reconstruct_time_sec": self.total_reconstruct_time_sec,
+            "best_acc": self.best_acc,
+            "num_rounds": NUM_ROUNDS,
+            "num_clients": NUM_CLIENTS,
+            "use_compression": self.use_compression,
+            "num_bits_start": self.num_bits_start,
+            "num_bits_end": self.num_bits_end,
+        })
+
+        np.savez(path, **save_kwargs)
+        print(f"Saved run data to {path}")
 
     def evaluate_global(self, final=False):
         self.global_model.eval()
-        all_preds, all_labels = [], []
+        all_preds, all_labels, all_probs = [], [], []
         with torch.no_grad():
             for batch in self.test_loader:
                 imu = batch["imu"].to(DEVICE).float()
                 labels = batch["label"].to(DEVICE).long()
                 outputs = self.global_model({"imu": imu})
+                probs = torch.softmax(outputs, dim=1)
                 preds = outputs.argmax(dim=1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
 
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
+        all_probs = np.array(all_probs)
+
         accuracy = accuracy_score(all_labels, all_preds)
+        precision_w = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+        recall_w = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+        f1_w = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
+        precision_m = precision_score(all_labels, all_preds, average="macro", zero_division=0)
+        recall_m = recall_score(all_labels, all_preds, average="macro", zero_division=0)
+        f1_m = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+
+        try:
+            from sklearn.preprocessing import label_binarize
+            from sklearn.metrics import roc_auc_score
+            classes = np.unique(all_labels)
+            y_onehot = label_binarize(all_labels, classes=classes)
+            auc_macro = roc_auc_score(y_onehot, all_probs, multi_class="ovr", average="macro")
+        except Exception:
+            auc_macro = float("nan")
+
         if not final:
-            return accuracy
+            return accuracy, precision_w, recall_w, f1_w, precision_m, recall_m, f1_m, auc_macro
 
-        precision = precision_score(all_labels, all_preds, average="weighted", zero_division=0)
-        recall = recall_score(all_labels, all_preds, average="weighted", zero_division=0)
-        f1 = f1_score(all_labels, all_preds, average="weighted", zero_division=0)
-
+        
         print(f"Accuracy : {accuracy:.4f}")
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall   : {recall:.4f}")
-        print(f"F1 Score : {f1:.4f}")
+        print(f"Precision (weighted): {precision_w:.4f} | (macro): {precision_m:.4f}")
+        print(f"Recall    (weighted): {recall_w:.4f} | (macro): {recall_m:.4f}")
+        print(f"F1        (weighted): {f1_w:.4f} | (macro): {f1_m:.4f}")
+        print(f"ROC-AUC (macro, OvR): {auc_macro:.4f}")
         print("\nClassification Report")
         print(classification_report(all_labels, all_preds, zero_division=0))
-        cm = confusion_matrix(all_labels, all_preds)
-        print("\nConfusion Matrix")
-        print(cm)
 
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-        plt.title(f"Final Confusion Matrix (FGMP, seed={SEED})")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.savefig(f"final_confusion_matrix_seed{SEED}.png")
-        plt.close()
+        self._final_all_labels = all_labels  
+        self._final_all_preds = all_preds     
+        self._final_all_probs = all_probs     
+
         return accuracy
 
 
@@ -481,20 +481,29 @@ def main(train_csv: str, test_csv: str):
     strategy = Strategy(
         test_loader=test_loader,
         use_compression=USE_COMPRESSION,
-        use_stability_reg=USE_STABILITY_REG,
         num_bits_start=NUM_BITS_START,
         num_bits_end=NUM_BITS_END,
-        stability_lambda=STABILITY_LAMBDA,
     )
 
     print(f"Starting FL | seed={SEED} | {NUM_CLIENTS} Clients | {NUM_ROUNDS} Rounds\n")
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.2 if torch.cuda.is_available() else 0},
-    )
+    from flwr.common import FitRes, Status, Code
+
+    params = [v.cpu().numpy() for v in strategy.global_model.state_dict().values()]
+
+    for rnd in range(1, NUM_ROUNDS + 1):
+        num_bits = strategy._num_bits_for_round(rnd)
+        strategy._current_num_bits = num_bits
+        results = []
+        for idx in range(NUM_CLIENTS):
+            c = IMUClient(client_datasets[idx])          # fresh client each round, as in the Ray version
+            arrays, n, metrics = c.fit(params, {"use_compression": USE_COMPRESSION, "num_bits": num_bits})
+            results.append((None, FitRes(status=Status(Code.OK, "ok"),
+                                        parameters=ndarrays_to_parameters(arrays),
+                                        num_examples=n, metrics=metrics)))
+            del c
+            torch.cuda.empty_cache()
+        agg, _ = strategy.aggregate_fit(rnd, results, [])
+        params = parameters_to_ndarrays(agg)
 
 if __name__ == "__main__":
     main(ARGS.train_csv, ARGS.test_csv)
