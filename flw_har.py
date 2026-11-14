@@ -80,20 +80,29 @@ class mp:
 
     @staticmethod
     def encode(delta_flat: np.ndarray, num_bits: int) -> dict:
-        """No selection, no dropping: every element goes through the same
-        num_bits quantizer. No mask/addr/submask needed -- decoder knows the
-        shape already, so 'which positions' is just 'all of them, in order'."""
         n = delta_flat.size
         scale, zmin = mp.compute_quant_params(delta_flat)
         q = mp.quantize_with_params(delta_flat, scale, zmin, num_bits).astype(np.uint32)
+
+        _t0 = time.perf_counter()
         packed = mp.pack_bits(q, num_bits)
-        return {"n": n, "num_bits": num_bits, "scale": float(scale), "zmin": float(zmin), "packed": packed}
+        pack_time = time.perf_counter() - _t0
+
+        return {"n": n, "num_bits": num_bits, "scale": float(scale), "zmin": float(zmin),
+                "packed": packed, "pack_time_sec": pack_time}
 
     @staticmethod
-    def decode(payload: dict) -> np.ndarray:
+    def decode(payload: dict, timing: dict = None) -> np.ndarray:
+        """If a `timing` dict is passed, the unpack time is accumulated into
+        timing['unpack'] (seconds)."""
         n = payload["n"]
         nbits = payload["num_bits"]
+
+        _t0 = time.perf_counter()
         q = mp.unpack_bits(payload["packed"], n, nbits)
+        if timing is not None:
+            timing["unpack"] = timing.get("unpack", 0.0) + (time.perf_counter() - _t0)
+
         return mp.dequantize_with_params(q, payload["scale"], payload["zmin"], nbits)
 
 
@@ -206,6 +215,7 @@ class IMUClient(fl.client.NumPyClient):
         comm_dense_bytes = 0
         comm_no_compression_bytes = 0
         transform_time_sec = 0.0
+        pack_time_sec = 0.0
 
         for name, new_val in new_state.items():
             old_val = old_state[name]
@@ -222,6 +232,7 @@ class IMUClient(fl.client.NumPyClient):
             delta_flat = delta.reshape(-1).astype(np.float32)
             payload = mp.encode(delta_flat, num_bits)
             transform_time_sec += time.perf_counter() - _t0
+            pack_time_sec += payload["pack_time_sec"]
 
             out_arrays.append(payload["packed"])
             meta.append({
@@ -236,6 +247,7 @@ class IMUClient(fl.client.NumPyClient):
             "comm_dense_bytes": comm_dense_bytes,
             "comm_no_compression_bytes": comm_no_compression_bytes,
             "transform_time_sec": transform_time_sec,
+            "pack_time_sec": pack_time_sec,
         }
         return out_arrays, len(self.train_loader.dataset), metrics
 
@@ -271,6 +283,8 @@ class Strategy(fl.server.strategy.FedAvg):
         self.total_comm_no_compression_bytes = 0
         self.total_transform_time_sec = 0.0
         self.total_reconstruct_time_sec = 0.0
+        self.total_pack_time_sec = 0.0     # avg-per-client pack time, summed over rounds
+        self.total_unpack_time_sec = 0.0   # server-side unpack time, summed over rounds
 
         # Per-round history -- populated in aggregate_fit(), consumed by
         # save_run_data(). This is our own tracking dict, distinct from
@@ -282,6 +296,8 @@ class Strategy(fl.server.strategy.FedAvg):
             "num_bits": [],
             "comm_dense_bytes": [],
             "comm_no_compression_bytes": [],
+            "pack_time_sec": [],
+            "unpack_time_sec": [],
         }
 
     def _num_bits_for_round(self, server_round):
@@ -311,6 +327,8 @@ class Strategy(fl.server.strategy.FedAvg):
         round_comm_dense_bytes = 0
         round_comm_no_compression_bytes = 0
         round_transform_time_sec = []
+        round_pack_time_sec = []
+        round_unpack_time_sec = 0.0
         round_reconstruct_time_sec = 0.0
 
         for _, fit_res in results:
@@ -321,7 +339,9 @@ class Strategy(fl.server.strategy.FedAvg):
             round_comm_dense_bytes += fit_res.metrics.get("comm_dense_bytes", 0)
             round_comm_no_compression_bytes += fit_res.metrics.get("comm_no_compression_bytes", 0)
             round_transform_time_sec.append(fit_res.metrics.get("transform_time_sec", 0.0))
+            round_pack_time_sec.append(fit_res.metrics.get("pack_time_sec", 0.0))
 
+            timing = {}
             _recon_start = time.perf_counter()
             cursor = 0
             for k, m in zip(keys, meta):
@@ -335,10 +355,11 @@ class Strategy(fl.server.strategy.FedAvg):
                         "n": m["size"], "num_bits": m["num_bits"],
                         "scale": m["scale"], "zmin": m["zmin"], "packed": packed,
                     }
-                    reconstructed = mp.decode(payload).reshape(shape)
+                    reconstructed = mp.decode(payload, timing).reshape(shape)
 
                 weighted_deltas[k] += reconstructed.astype(np.float64) * num_examples
             round_reconstruct_time_sec += time.perf_counter() - _recon_start
+            round_unpack_time_sec += timing.get("unpack", 0.0)
             total_examples += num_examples
 
         new_state = {}
@@ -354,7 +375,10 @@ class Strategy(fl.server.strategy.FedAvg):
         self.total_comm_dense_bytes += round_comm_dense_bytes
         self.total_comm_no_compression_bytes += round_comm_no_compression_bytes
         avg_transform_time = float(np.mean(round_transform_time_sec)) if round_transform_time_sec else 0.0
+        avg_pack_time = float(np.mean(round_pack_time_sec)) if round_pack_time_sec else 0.0
         self.total_transform_time_sec += avg_transform_time
+        self.total_pack_time_sec += avg_pack_time
+        self.total_unpack_time_sec += round_unpack_time_sec
         self.total_reconstruct_time_sec += round_reconstruct_time_sec
 
         # Record this round in our own history dict (see __init__).
@@ -363,6 +387,8 @@ class Strategy(fl.server.strategy.FedAvg):
         self.history["num_bits"].append(self._current_num_bits)
         self.history["comm_dense_bytes"].append(round_comm_dense_bytes)
         self.history["comm_no_compression_bytes"].append(round_comm_no_compression_bytes)
+        self.history["pack_time_sec"].append(avg_pack_time)
+        self.history["unpack_time_sec"].append(round_unpack_time_sec)
 
         compression_vs_baseline = (
             round_comm_dense_bytes / round_comm_no_compression_bytes
@@ -371,8 +397,10 @@ class Strategy(fl.server.strategy.FedAvg):
         print(f"Round {server_round}/{NUM_ROUNDS} - Accuracy: {acc:.4f} | num_bits={self._current_num_bits}")
         print(f"  [comm] ACTUALLY SENT: {round_comm_dense_bytes/1e6:.3f} MB "
               f"({compression_vs_baseline*100:.1f}% of no-compression baseline: {round_comm_no_compression_bytes/1e6:.3f} MB)")
-        print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms | "
-              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms")
+        print(f"  [compute] avg client transform_time: {avg_transform_time*1000:.2f}ms "
+              f"(of which bit-pack: {avg_pack_time*1000:.2f}ms) | "
+              f"server reconstruct_time: {round_reconstruct_time_sec*1000:.2f}ms "
+              f"(of which bit-unpack: {round_unpack_time_sec*1000:.2f}ms)")
 
         if acc > self.best_acc:
             self.best_acc = acc
@@ -381,6 +409,8 @@ class Strategy(fl.server.strategy.FedAvg):
         if server_round == NUM_ROUNDS:
             print("\n========== FINAL EVALUATION ==========")
             self.evaluate_global(final=True)
+            print(f"Total bit-pack time (avg client, summed over rounds): {self.total_pack_time_sec:.3f}s")
+            print(f"Total bit-unpack time (server, summed over rounds):   {self.total_unpack_time_sec:.3f}s")
             self.save_run_data()
 
         return aggregated_params, {"accuracy": acc, "comm_dense_bytes": round_comm_dense_bytes}
@@ -397,6 +427,8 @@ class Strategy(fl.server.strategy.FedAvg):
             "total_comm_no_compression_bytes": self.total_comm_no_compression_bytes,
             "total_transform_time_sec": self.total_transform_time_sec,
             "total_reconstruct_time_sec": self.total_reconstruct_time_sec,
+            "total_pack_time_sec": self.total_pack_time_sec,
+            "total_unpack_time_sec": self.total_unpack_time_sec,
             "best_acc": self.best_acc,
             "num_rounds": NUM_ROUNDS,
             "num_clients": NUM_CLIENTS,
